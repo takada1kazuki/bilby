@@ -8,7 +8,7 @@ from scipy.interpolate import InterpolatedUnivariateSpline
 from scipy.special import hyp2f1
 from scipy.stats import norm
 
-from ..compat.utils import xp_wrap
+from ..compat.utils import array_module, xp_wrap
 from ..core.prior import (
     PriorDict,
     Uniform,
@@ -26,7 +26,13 @@ from ..core.prior import (
     JointPrior,
     JointPriorDistError,
 )
-from ..core.utils import infer_args_from_method, logger, random, interp1d
+from ..core.utils import (
+    infer_args_from_function_except_n_args,
+    infer_args_from_method,
+    logger,
+    random,
+    interp1d,
+)
 from .conversion import (
     convert_to_lal_binary_black_hole_parameters,
     convert_to_lal_binary_neutron_star_parameters,
@@ -702,10 +708,38 @@ class ConditionalChiInPlane(ConditionalBasePrior):
         p(a) &= \frac{1}{a_{\max}} \\
         p(\chi_\perp) &= \frac{2 N \chi_\perp}{\chi^2 + \chi_\perp^2} \\
         N^{-1} &= 2 \ln\left(\frac{a_\max}{|\chi|}\right)
+
+    By default the aligned component `\chi` is the sampled parameter.
+    If it is instead derived from other parameters, give a function computing it as
+    `aligned_spin_func`.
+
+    Parameters
+    ==========
+    minimum: float
+        See superclass
+    maximum: float
+        The maximum spin magnitude :math:`a_\max`.
+    name: str
+        See superclass
+    latex_label: str
+        See superclass
+    unit: str
+        See superclass
+    boundary: str
+        See superclass
+    aligned_spin_func: func, optional
+        Function returning the aligned spin component.
     """
 
     def __init__(
-        self, minimum, maximum, name, latex_label=None, unit=None, boundary=None
+        self,
+        minimum,
+        maximum,
+        name,
+        latex_label=None,
+        unit=None,
+        boundary=None,
+        aligned_spin_func=None,
     ):
         super(ConditionalChiInPlane, self).__init__(
             minimum=minimum,
@@ -716,7 +750,13 @@ class ConditionalChiInPlane(ConditionalBasePrior):
             boundary=boundary,
             condition_func=self._condition_function,
         )
-        self._required_variables = [name[:5]]
+        self.aligned_spin_func = aligned_spin_func
+        if aligned_spin_func is None:
+            self._required_variables = [name[:5]]
+        else:
+            self._required_variables = infer_args_from_function_except_n_args(
+                aligned_spin_func, n=0
+            )
         self._reference_maximum = maximum
         self.__class__.__name__ = "ConditionalChiInPlane"
         self.__class__.__qualname__ = "ConditionalChiInPlane"
@@ -726,7 +766,7 @@ class ConditionalChiInPlane(ConditionalBasePrior):
         parameters = self.condition_func(
             self.reference_params.copy(), **required_variables
         )
-        chi_aligned = abs(required_variables[self._required_variables[0]])
+        chi_aligned = abs(self._chi_aligned(required_variables))
         minimum = parameters.get("minimum", self.minimum)
         maximum = parameters.get("maximum", self.maximum)
         return (
@@ -762,7 +802,7 @@ class ConditionalChiInPlane(ConditionalBasePrior):
 
         """
         self.update_conditions(**required_variables)
-        chi_aligned = abs(required_variables[self._required_variables[0]])
+        chi_aligned = abs(self._chi_aligned(required_variables))
         return xp.clip(
             (val >= self.minimum)
             * (val <= self.maximum)
@@ -791,21 +831,37 @@ class ConditionalChiInPlane(ConditionalBasePrior):
             The in-plane component of the spin
         """
         self.update_conditions(**required_variables)
-        chi_aligned = abs(required_variables[self._required_variables[0]])
+        chi_aligned = abs(self._chi_aligned(required_variables))
         return (
             chi_aligned
             * ((self._reference_maximum / chi_aligned) ** (2 * val) - 1) ** 0.5
         )
 
+    def _chi_aligned(self, required_variables):
+        """Aligned spin component, given the required variables."""
+        if self.aligned_spin_func is None:
+            return required_variables[self._required_variables[0]]
+        chi_aligned = self.aligned_spin_func(
+            **{key: required_variables[key] for key in self._required_variables}
+        )
+        return array_module(chi_aligned).clip(
+            chi_aligned, -self._reference_maximum, self._reference_maximum
+        )
+
     def _condition_function(self, reference_params, **kwargs):
         with np.errstate(invalid="ignore"):
             maximum = (
-                self._reference_maximum**2 - kwargs[self._required_variables[0]] ** 2
+                self._reference_maximum**2 - self._chi_aligned(kwargs) ** 2
             ) ** 0.5
         return dict(minimum=0, maximum=maximum)
 
     def __repr__(self):
-        return Prior.__repr__(self)
+        string = Prior.__repr__(self)
+        func = self.aligned_spin_func
+        if func is not None:
+            # Write the function as an importable path so that the repr can be parsed.
+            string = string.replace(repr(func), f"{func.__module__}.{func.__name__}")
+        return string
 
     def get_instantiation_dict(self):
         instantiation_dict = Prior.get_instantiation_dict(self)

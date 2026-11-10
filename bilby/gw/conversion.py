@@ -1340,6 +1340,58 @@ def mass_2_and_chirp_mass_to_mass_ratio(mass_2, chirp_mass):
     return 1 / mass_1_and_chirp_mass_to_mass_ratio(mass_2, chirp_mass)
 
 
+def chi_1_from_chi_eff_and_chi_2(mass_ratio, chi_eff, chi_2):
+    """
+    Convert the effective spin and the aligned spin of the secondary to the
+    aligned spin of the primary.
+
+    .. math::
+
+        \\chi_1 = (1 + q) \\chi_{\\rm eff} - q \\chi_2
+
+    Parameters
+    ==========
+    mass_ratio: float
+        Mass ratio of the binary, q = m_2 / m_1 <= 1
+    chi_eff: float
+        Effective aligned spin
+    chi_2: float
+        Aligned spin of the secondary
+
+    Returns
+    =======
+    chi_1: float
+        Aligned spin of the primary
+    """
+    return (1 + mass_ratio) * chi_eff - mass_ratio * chi_2
+
+
+def chi_2_from_chi_eff_and_chi_1(mass_ratio, chi_eff, chi_1):
+    """
+    Convert the effective spin and the aligned spin of the primary to the
+    aligned spin of the secondary.
+
+    .. math::
+
+        \\chi_2 = \\frac{(1 + q) \\chi_{\\rm eff} - \\chi_1}{q}
+
+    Parameters
+    ==========
+    mass_ratio: float
+        Mass ratio of the binary, q = m_2 / m_1 <= 1
+    chi_eff: float
+        Effective aligned spin
+    chi_1: float
+        Aligned spin of the primary
+
+    Returns
+    =======
+    chi_2: float
+        Aligned spin of the secondary
+    """
+    return ((1 + mass_ratio) * chi_eff - chi_1) / mass_ratio
+
+
 def lambda_1_lambda_2_to_lambda_tilde(lambda_1, lambda_2, mass_1, mass_2):
     """
     Convert from individual tidal parameters to domainant tidal term.

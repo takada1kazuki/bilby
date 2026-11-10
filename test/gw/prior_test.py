@@ -627,5 +627,60 @@ class TestConditionalChiUniformSpinMagnitude(unittest.TestCase):
         self.assertEqual(aac.get_namespace(samples), self.xp)
 
 
+class TestConditionalChiInPlane(unittest.TestCase):
+    def setUp(self):
+        self.a_max = 0.99
+        rng = np.random.default_rng(1)
+        n_samples = 10000
+        self.mass_ratio = rng.uniform(0.1, 1, n_samples)
+        self.chi_1 = rng.uniform(-self.a_max, self.a_max, n_samples)
+        self.chi_2 = rng.uniform(-self.a_max, self.a_max, n_samples)
+        self.chi_eff = (self.chi_1 + self.mass_ratio * self.chi_2) / (
+            1 + self.mass_ratio
+        )
+        # Recompute chi_1 so that both priors see exactly the same aligned spin.
+        self.chi_1 = conversion.chi_1_from_chi_eff_and_chi_2(
+            mass_ratio=self.mass_ratio, chi_eff=self.chi_eff, chi_2=self.chi_2
+        )
+        self.unit = rng.uniform(0, 1, n_samples)
+        self.direct = bilby.gw.prior.ConditionalChiInPlane(
+            minimum=0, maximum=self.a_max, name="chi_1_in_plane"
+        )
+        self.derived = bilby.gw.prior.ConditionalChiInPlane(
+            minimum=0,
+            maximum=self.a_max,
+            name="chi_1_in_plane",
+            aligned_spin_func=conversion.chi_1_from_chi_eff_and_chi_2,
+        )
+        self.derived_kwargs = dict(
+            chi_eff=self.chi_eff, mass_ratio=self.mass_ratio, chi_2=self.chi_2
+        )
+
+    def test_required_variables(self):
+        self.assertEqual(self.direct.required_variables, ["chi_1"])
+        self.assertEqual(
+            self.derived.required_variables, ["mass_ratio", "chi_eff", "chi_2"]
+        )
+
+    def test_derived_aligned_spin_matches_direct(self):
+        direct = self.direct.rescale(self.unit, chi_1=self.chi_1)
+        derived = self.derived.rescale(self.unit, **self.derived_kwargs)
+        np.testing.assert_array_equal(derived, direct)
+        np.testing.assert_array_equal(
+            self.derived.prob(direct, **self.derived_kwargs),
+            self.direct.prob(direct, chi_1=self.chi_1),
+        )
+        np.testing.assert_array_equal(
+            self.derived.cdf(direct, **self.derived_kwargs),
+            self.direct.cdf(direct, chi_1=self.chi_1),
+        )
+
+    def test_rescale(self):
+        samples = self.derived.rescale(self.unit, **self.derived_kwargs)
+        np.testing.assert_allclose(
+            self.derived.cdf(samples, **self.derived_kwargs), self.unit, atol=1e-14
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
