@@ -944,5 +944,112 @@ class TestConditionalIsotropicChi2zPrior(unittest.TestCase):
         )
 
 
+class TestMu1Prior(unittest.TestCase):
+    def setUp(self):
+        self.mc_min, self.mc_max = 1.64, 1.67
+        self.mc_ref = 0.5 * (self.mc_min + self.mc_max)
+        self.fref = 200.0
+        self.reference = dict(
+            Mcref=self.mc_ref,
+            fref=self.fref,
+        )
+        # mu1 at fixed (q, chi_1, chi_2); mu1 decreases with the chirp mass.
+        self.spins = dict(mass_ratio=0.8, chi_1=0.1, chi_2=-0.05)
+        self.minimum = bilby.gw.conversion.mu1_approx(
+            self.mc_max, **self.spins, **self.reference
+        )
+        self.maximum = bilby.gw.conversion.mu1_approx(
+            self.mc_min, **self.spins, **self.reference
+        )
+        self.prior = bilby.gw.prior.Mu1Prior(
+            minimum=self.minimum,
+            maximum=self.maximum,
+            Mcref=self.mc_ref,
+            fref=self.fref,
+            minimum_chirp_mass=self.mc_min,
+            maximum_chirp_mass=self.mc_max,
+        )
+        self.unit = np.random.default_rng(5).uniform(0, 1, 1000)
+
+    def test_mu1_to_mc_inverts_mu1_approx(self):
+        chirp_mass = np.linspace(self.mc_min, self.mc_max, 11)
+        mu1 = bilby.gw.conversion.mu1_approx(chirp_mass, **self.spins, **self.reference)
+        np.testing.assert_allclose(
+            bilby.gw.conversion.mu1_to_chirp_mass(mu1, **self.spins, **self.reference),
+            chirp_mass,
+            rtol=1e-12,
+        )
+
+    def test_prob_is_normalized(self):
+        norm, _ = quad(self.prior.prob, self.minimum, self.maximum)
+        self.assertAlmostEqual(norm, 1, places=12)
+
+    def test_rescale_inverts_cdf(self):
+        samples = self.prior.rescale(self.unit)
+        np.testing.assert_allclose(
+            self.prior.cdf(samples), self.unit, rtol=0, atol=1e-12
+        )
+
+    def test_rescale_end_points(self):
+        self.assertAlmostEqual(self.prior.rescale(0), self.minimum, places=10)
+        self.assertAlmostEqual(self.prior.rescale(1), self.maximum, places=10)
+
+    def test_matches_chirp_mass_prior_at_fixed_spins(self):
+        # At fixed (q, chi_1, chi_2), mu1 is linear in the chirp mass, so the
+        # chirp-mass prior p(Mc) proportional to Mc maps exactly onto this prior.
+        rng = np.random.default_rng(6)
+        chirp_mass = np.sqrt(rng.uniform(self.mc_min**2, self.mc_max**2, 100000))
+        expected = bilby.gw.conversion.mu1_approx(
+            chirp_mass, **self.spins, **self.reference
+        )
+        samples = self.prior.rescale(rng.uniform(0, 1, 100000))
+        self.assertGreater(ks_2samp(samples, expected).pvalue, 0.001)
+
+    def test_negative_density_raises(self):
+        with self.assertRaises(ValueError):
+            bilby.gw.prior.Mu1Prior(
+                minimum=self.minimum,
+                maximum=self.maximum + 100 * (self.maximum - self.minimum),
+                Mcref=self.mc_ref,
+                fref=self.fref,
+                minimum_chirp_mass=self.mc_min,
+                maximum_chirp_mass=self.mc_max,
+            )
+
+    def test_repr_round_trip(self):
+        new = bilby.core.prior.PriorDict({"mu1": repr(self.prior)})["mu1"]
+        self.assertIsInstance(new, bilby.gw.prior.Mu1Prior)
+        np.testing.assert_array_equal(
+            new.rescale(self.unit), self.prior.rescale(self.unit)
+        )
+
+    def test_bns_prior_dict_with_mass_constraints(self):
+        # The default conversion takes Mcref and fref from the mu1 prior.
+        def to_mass_1(chirp_mass):
+            return conversion.chirp_mass_and_mass_ratio_to_component_masses(
+                chirp_mass, self.spins["mass_ratio"]
+            )[0]
+
+        mass_1_cut = to_mass_1(0.5 * (self.mc_min + self.mc_max))
+        priors = bilby.gw.prior.BNSPriorDict(
+            dictionary=dict(
+                mu1=self.prior,
+                mass_ratio=self.spins["mass_ratio"],
+                chi_1=self.spins["chi_1"],
+                chi_2=self.spins["chi_2"],
+                mass_1=bilby.core.prior.Constraint(0.0, mass_1_cut, name="mass_1"),
+            )
+        )
+        samples = priors.sample(1000)
+        mass_1 = to_mass_1(
+            bilby.gw.conversion.mu1_to_chirp_mass(
+                samples["mu1"], **self.spins, **self.reference
+            )
+        )
+        self.assertEqual(len(samples["mu1"]), 1000)
+        self.assertTrue(np.all(mass_1 <= mass_1_cut))
+        self.assertLess(np.min(mass_1), to_mass_1(self.mc_min) + 1e-3)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,3 +1,4 @@
+import json
 import unittest
 
 import array_api_compat as aac
@@ -626,6 +627,217 @@ class TestGenerateAllParameters(unittest.TestCase):
             self.assertIn(key, output_sample)
         for key, val in self.parameters.items():
             self.assertTrue(output_sample[key] == val)
+
+
+def _convert_with_mu1(parameters):
+    # A module-level function, as passed to a WaveformGenerator in a PE script.
+    return conversion.convert_to_lal_binary_neutron_star_parameters(
+        parameters, Mcref=TestMu1Conversion.Mcref, fref=TestMu1Conversion.fref
+    )
+
+
+class TestMu1Conversion(unittest.TestCase):
+    Mcref = 1.19
+    fref = 200.0
+
+    def setUp(self):
+        self.chirp_mass = 1.2
+        self.spins = dict(mass_ratio=0.8, chi_1=0.02, chi_2=-0.01)
+        self.mu1 = conversion.mu1_approx(
+            self.chirp_mass,
+            **self.spins,
+            Mcref=self.Mcref,
+            fref=self.fref,
+        )
+        self.parameters = dict(
+            mu1=self.mu1,
+            luminosity_distance=100.0,
+            theta_jn=0.4,
+            psi=0.1,
+            phase=0.2,
+            geocent_time=0.0,
+            ra=1.0,
+            dec=0.5,
+            lambda_1=300.0,
+            lambda_2=300.0,
+            **self.spins,
+        )
+
+    def _convert(self, parameters, **kwargs):
+        return conversion.convert_to_lal_binary_neutron_star_parameters(
+            parameters, **kwargs
+        )
+
+    def test_bns_conversion_adds_chirp_mass(self):
+        original = self.parameters.copy()
+        converted, added_keys = self._convert(
+            self.parameters,
+            Mcref=self.Mcref,
+            fref=self.fref,
+        )
+        self.assertAlmostEqual(converted["chirp_mass"], self.chirp_mass, places=12)
+        self.assertIn("chirp_mass", added_keys)
+        for key in ["mass_1", "mass_2"]:
+            self.assertIn(key, converted)
+        self.assertAlmostEqual(
+            conversion.component_masses_to_chirp_mass(
+                converted["mass_1"], converted["mass_2"]
+            ),
+            self.chirp_mass,
+            places=12,
+        )
+        self.assertEqual(self.parameters, original)
+
+    def test_existing_chirp_mass_is_kept(self):
+        self.parameters["chirp_mass"] = 1.3
+        converted, added_keys = self._convert(self.parameters)
+        self.assertEqual(converted["chirp_mass"], 1.3)
+        self.assertNotIn("chirp_mass", added_keys)
+
+    def test_missing_mcref_raises(self):
+        with self.assertRaises(ValueError):
+            self._convert(self.parameters)
+
+    def test_waveform_generator_with_conversion_function(self):
+        waveform_generator = bilby.gw.WaveformGenerator(
+            duration=4,
+            sampling_frequency=2048,
+            frequency_domain_source_model=bilby.gw.source.lal_binary_neutron_star,
+            parameter_conversion=_convert_with_mu1,
+            waveform_arguments=dict(
+                waveform_approximant="TaylorF2", reference_frequency=20.0
+            ),
+        )
+        with_mu1 = waveform_generator.frequency_domain_strain(self.parameters)
+        parameters = self.parameters.copy()
+        del parameters["mu1"]
+        parameters["chirp_mass"] = self.chirp_mass
+        with_chirp_mass = waveform_generator.frequency_domain_strain(parameters)
+        np.testing.assert_allclose(
+            with_mu1["plus"], with_chirp_mass["plus"], rtol=1e-10, atol=0
+        )
+        # The conversion function must be saved in the result JSON.
+        encoded = json.dumps(
+            waveform_generator.parameter_conversion,
+            cls=bilby.core.utils.BilbyJsonEncoder,
+        )
+        decoded = json.loads(encoded, object_hook=bilby.core.utils.decode_bilby_json)
+        self.assertIs(decoded, _convert_with_mu1)
+
+    def test_generate_all_bns_parameters_with_mu1(self):
+        data_frame = pd.DataFrame(
+            {key: [value] * 10 for key, value in self.parameters.items()}
+        )
+        # Mcref is taken from the mu1 prior, or given explicitly.
+        mu1_range = [
+            conversion.mu1_approx(
+                chirp_mass,
+                **self.spins,
+                Mcref=self.Mcref,
+                fref=self.fref,
+            )
+            for chirp_mass in [1.21, 1.17]
+        ]
+        priors = bilby.core.prior.PriorDict(
+            dict(
+                mu1=bilby.gw.prior.Mu1Prior(
+                    minimum=mu1_range[0],
+                    maximum=mu1_range[1],
+                    Mcref=self.Mcref,
+                    fref=self.fref,
+                    minimum_chirp_mass=1.17,
+                    maximum_chirp_mass=1.21,
+                )
+            )
+        )
+        for kwargs in [
+            dict(priors=priors),
+            dict(
+                Mcref=self.Mcref,
+                fref=self.fref,
+            ),
+        ]:
+            for sample in [self.parameters, data_frame]:
+                output = conversion.generate_all_bns_parameters(sample, **kwargs)
+                np.testing.assert_allclose(output["chirp_mass"], self.chirp_mass)
+                for key in ["mass_1", "mass_2", "total_mass", "lambda_tilde"]:
+                    self.assertIn(key, output)
+                self.assertNotIn("Mcref", output)
+
+    def test_bns_conversion_with_chi_eff(self):
+        # chi_1 is derived from chi_eff before mu1 is converted.
+        parameters = self.parameters.copy()
+        chi_1 = parameters.pop("chi_1")
+        mass_ratio, chi_2 = self.spins["mass_ratio"], self.spins["chi_2"]
+        parameters["chi_eff"] = (chi_1 + mass_ratio * chi_2) / (1 + mass_ratio)
+        converted, added_keys = self._convert(
+            parameters, Mcref=self.Mcref, fref=self.fref
+        )
+        self.assertAlmostEqual(converted["chi_1"], chi_1, places=14)
+        self.assertAlmostEqual(converted["chirp_mass"], self.chirp_mass, places=12)
+        for key in ["chi_1", "chirp_mass"]:
+            self.assertIn(key, added_keys)
+
+
+class TestChi1FromChiEffConversion(unittest.TestCase):
+    def setUp(self):
+        self.mass_ratio = 0.5
+        self.chi_1 = 0.3
+        self.chi_2 = -0.2
+        self.chi_eff = (self.chi_1 + self.mass_ratio * self.chi_2) / (
+            1 + self.mass_ratio
+        )
+        self.parameters = dict(
+            chirp_mass=10.0,
+            mass_ratio=self.mass_ratio,
+            chi_eff=self.chi_eff,
+            chi_2=self.chi_2,
+        )
+
+    def test_bbh_conversion_adds_chi_1(self):
+        converted, added_keys = conversion.convert_to_lal_binary_black_hole_parameters(
+            self.parameters
+        )
+        self.assertAlmostEqual(converted["chi_1"], self.chi_1, places=14)
+        self.assertIn("chi_1", added_keys)
+        self.assertNotIn("chi_1", self.parameters)
+        self.assertAlmostEqual(converted["a_1"], self.chi_1, places=14)
+        self.assertEqual(converted["tilt_1"], 0.0)
+        self.assertAlmostEqual(converted["a_2"], abs(self.chi_2), places=14)
+        self.assertEqual(converted["tilt_2"], np.pi)
+
+    def test_mass_ratio_from_component_masses(self):
+        parameters = self.parameters.copy()
+        del parameters["chirp_mass"], parameters["mass_ratio"]
+        parameters.update(mass_1=20.0, mass_2=20.0 * self.mass_ratio)
+        converted, _ = conversion.convert_to_lal_binary_black_hole_parameters(
+            parameters
+        )
+        self.assertAlmostEqual(converted["chi_1"], self.chi_1, places=14)
+
+    def test_in_plane_spin(self):
+        self.parameters.update(chi_1_in_plane=0.4, chi_2_in_plane=0.1)
+        converted, _ = conversion.convert_to_lal_binary_black_hole_parameters(
+            self.parameters
+        )
+        self.assertAlmostEqual(converted["a_1"], 0.5, places=14)
+        self.assertAlmostEqual(np.cos(converted["tilt_1"]), 0.6, places=14)
+
+    def test_existing_chi_1_is_kept(self):
+        self.parameters["chi_1"] = 0.1
+        converted, added_keys = conversion.convert_to_lal_binary_black_hole_parameters(
+            self.parameters
+        )
+        self.assertEqual(converted["chi_1"], 0.1)
+        self.assertNotIn("chi_1", added_keys)
+
+    def test_array_input(self):
+        parameters = {key: np.full(5, value) for key, value in self.parameters.items()}
+        converted, _ = conversion.convert_to_lal_binary_black_hole_parameters(
+            parameters
+        )
+        np.testing.assert_allclose(converted["chi_1"], self.chi_1, atol=1e-14)
+        np.testing.assert_allclose(converted["a_1"], self.chi_1, atol=1e-14)
 
 
 class TestDistanceTransformations(unittest.TestCase):
