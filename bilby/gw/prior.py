@@ -1,11 +1,14 @@
 import os
 import copy
+import zipfile
 
 import array_api_extra as xpx
 import numpy as np
 from scipy.integrate import cumulative_trapezoid, trapezoid, quad
+from scipy.optimize import brentq
 from scipy.interpolate import InterpolatedUnivariateSpline
-from scipy.special import hyp2f1
+from scipy.special import beta as beta_function
+from scipy.special import betainc, hyp2f1, spence
 from scipy.stats import norm
 
 from ..compat.utils import array_module, xp_wrap
@@ -869,6 +872,1341 @@ class ConditionalChiInPlane(ConditionalBasePrior):
             if key in instantiation_dict:
                 instantiation_dict[key] = value
         return instantiation_dict
+
+
+DEFAULT_CHI_EFF_TABLE_GRID = dict(n_q=200, n_u=1025)
+DEFAULT_CHI2_TABLE_GRID = dict(n_q=120, n_chieff=301, n_u=801)
+
+# ============================================================
+# Loading / building the chi_eff and chi_2 tables
+# ============================================================
+
+
+def _check_table(table, q_min, q_max, a_max, grid):
+    """Raise ValueError if a loaded table does not match the requested settings
+    or has non-finite entries (table.filename is the loaded file)."""
+    problems = []
+    if not np.isclose(table.a_max, a_max):
+        problems.append(f"a_max={table.a_max} (expected {a_max})")
+    if not np.isclose(table.q_grid[0], q_min) or not np.isclose(
+        table.q_grid[-1], q_max
+    ):
+        problems.append(
+            f"q range=({table.q_grid[0]}, {table.q_grid[-1]}) "
+            f"(expected ({q_min}, {q_max}))"
+        )
+
+    sizes = dict(n_q=len(table.q_grid), n_u=len(table.u_grid))
+    if hasattr(table, "chieff_grid"):
+        sizes["n_chieff"] = len(table.chieff_grid)
+    for key, expected in grid.items():
+        if sizes.get(key) != int(expected):
+            problems.append(f"{key}={sizes.get(key)} (expected {expected})")
+
+    n_bad = int(np.sum(~np.isfinite(table.inv_table)))
+    if n_bad:
+        problems.append(f"{n_bad} non-finite (NaN or inf) table entries")
+
+    if problems:
+        raise ValueError(
+            f"The existing table {table.filename} does not match the requested settings: "
+            + "; ".join(problems)
+            + ". Delete the file to rebuild it, or pass the matching settings."
+        )
+
+
+def load_or_build_tables(
+    q_min,
+    q_max,
+    a_max,
+    chi_eff_file,
+    chi2_file,
+    chi_eff_grid=None,
+    chi2_grid=None,
+    chi_eff_dtype=np.float64,
+    chi2_dtype=np.float32,
+):
+    """Load or build the chi_eff / chi_2 inverse-CDF tables.
+
+    If a file already exists, the table is loaded and settings will be checked (_check_table);
+    otherwise it is newly built, checked for non-finite entries and saved.
+    """
+    chi_eff_grid = dict(
+        DEFAULT_CHI_EFF_TABLE_GRID if chi_eff_grid is None else chi_eff_grid
+    )
+    chi2_grid = dict(DEFAULT_CHI2_TABLE_GRID if chi2_grid is None else chi2_grid)
+
+    if os.path.exists(chi_eff_file):
+        logger.info(f"Loading chi_eff table {chi_eff_file}")
+        chi_eff_table = ChieffTable.load(chi_eff_file)
+        _check_table(chi_eff_table, q_min, q_max, a_max, chi_eff_grid)
+    else:
+        logger.info(f"Building chi_eff table {chi_eff_file}")
+        chi_eff_table = ChieffTable(
+            q_min=q_min,
+            q_max=q_max,
+            a_max=a_max,
+            dtype=chi_eff_dtype,
+            **chi_eff_grid,
+        )
+        if not np.all(np.isfinite(chi_eff_table.inv_table)):
+            raise ValueError("The newly built chi_eff table has non-finite entries.")
+        chi_eff_table.save(chi_eff_file)
+
+    if os.path.exists(chi2_file):
+        logger.info(f"Loading chi_2 table {chi2_file}")
+        chi2_table = Chi2zTable.load(chi2_file)
+        _check_table(chi2_table, q_min, q_max, a_max, chi2_grid)
+    else:
+        logger.info(f"Building chi_2 table {chi2_file}")
+        chi2_table = Chi2zTable(
+            q_min=q_min,
+            q_max=q_max,
+            a_max=a_max,
+            dtype=chi2_dtype,
+            **chi2_grid,
+        )
+        if not np.all(np.isfinite(chi2_table.inv_table)):
+            raise ValueError("The newly built chi_2 table has non-finite entries.")
+        chi2_table.save(chi2_file)
+
+    logger.info(
+        f"Inverse-CDF tables ready: chi_eff {chi_eff_table.inv_table.shape}, "
+        f"chi_2 {chi2_table.inv_table.shape}"
+    )
+    return chi_eff_table, chi2_table
+
+
+def _newton_update(
+    x, u, lower, upper, cdf_pdf_func, n_newton, pdf_floor=1e-300, atol=1e-11
+):
+    """
+    Solve F(x) = u on (lower, upper) with Newton's method.
+
+    Takes up to ``n_newton`` steps and stops as soon as |F(x) - u| <= tolerance,
+    where tolerance = min(atol, max(5e-16, 1e-7 min(u, 1 - u))) is tightened
+    near u = 0 and 1 to keep a relative accuracy in the tails.
+    It stops without converging if the pdf is <= ``pdf_floor`` or NaN, a step
+    leaves (lower, upper), or a step does not change x.
+
+    Parameters
+    ==========
+    x: float
+        Initial guess (from the inverse-CDF table).
+    u: float
+        Target CDF value.
+    lower, upper: float
+        Interval in which the root is searched.
+    cdf_pdf_func: callable
+        cdf_pdf_func(x) returns (F(x), pdf(x)).
+    n_newton: int
+        Maximum number of Newton steps.
+
+    Returns
+    =======
+    (x, F, converged): (float, float, bool)
+        current value, its CDF value, and judgement of convergence.
+        If not converged they are passed on to _brent_update.
+    """
+    tolerance = min(atol, max(5e-16, 1e-7 * min(u, 1.0 - u)))
+
+    F, pdf = cdf_pdf_func(x)
+    for step in range(n_newton + 1):
+        # If the CDF value F is close enough to the given u, quit _newton_update.
+        if abs(F - u) <= tolerance:
+            return float(x), F, True
+        # If the step count reaches n_newton, or the pdf is <= pdf_floor or NaN,
+        # stop the Newton steps and go to _brent_update.
+        if step == n_newton or not pdf > pdf_floor:
+            break
+        candidate = x - (F - u) / pdf
+        # If the candidate is out of (lower, upper) or does not change x,
+        # stop the Newton steps and go to _brent_update.
+        if not lower < candidate < upper or candidate == x:
+            break
+        x = float(candidate)
+        F, pdf = cdf_pdf_func(x)
+    return float(x), F, False
+
+
+def _brent_update(x, F, u, lower, upper, cdf_func):
+    """
+    Solve F(x) = u on [lower, upper] with Brent's method.
+
+    Parameters
+    ==========
+    x, F: float
+        The last point of _newton_update and its CDF value.
+    u: float
+        Target CDF value.
+    lower, upper: float
+        Interval in which the root is searched.
+    cdf_func: callable
+        cdf_func(x) returns F(x).
+
+    Returns
+    =======
+    float
+        The root, i.e. the parameter value itself (chi_eff or chi_2).
+
+    Raises
+    ======
+    FloatingPointError
+        If [lower, upper] is not a finite, non-empty interval.
+    """
+    if not (np.isfinite(lower) and np.isfinite(upper) and lower < upper):
+        raise FloatingPointError("Invalid support in inverse CDF correction")
+    if np.isfinite(F) and lower < x < upper:
+        if F < u:
+            lower = x
+        else:
+            upper = x
+    lower, upper = float(lower), float(upper)
+    try:
+        root = brentq(
+            lambda y: float(cdf_func(y)) - u,
+            lower,
+            upper,
+            xtol=max(1e-12 * (upper - lower), 1e-16),
+            maxiter=120,
+        )
+    except (ValueError, RuntimeError) as exc:
+        # ValueError: no sign change on [lower, upper], or the CDF returned NaN.
+        # RuntimeError: no convergence within maxiter iterations.
+        logger.warning(
+            f"Inverse CDF: Brent failed for u={u} on [{lower}, {upper}] ({exc!r}); "
+            "using the last Newton value instead."
+        )
+        best = float(x) if np.isfinite(x) else 0.5 * (lower + upper)
+        return min(max(best, lower), upper)
+    return float(root)
+
+
+def _table_for_prior(table, table_file, table_class, table_settings=None):
+    """
+    Return the inverse-CDF table of a prior.
+
+    ``table`` is returned if given.  Otherwise (e.g. for a prior restored from
+    JSON) the table is loaded from ``table_file``.  If the file is missing,
+    broken or does not match ``table_settings``, the table is rebuilt from
+    ``table_settings`` with a warning; the rebuilt table is the same as the
+    original one, since the table is fully determined by its settings.
+
+    Parameters
+    ==========
+    table: ChieffTable or Chi2zTable, or None
+        Table passed directly to the prior.
+    table_file: str or None
+        Path of the saved table (stored in the prior JSON).
+    table_class: type
+        ChieffTable or Chi2zTable, used to load or rebuild the table.
+    table_settings: dict, optional
+        table.settings() of the original table (stored in the prior JSON).
+
+    Returns
+    =======
+    ChieffTable or Chi2zTable
+        The given, loaded or rebuilt table.
+
+    Raises
+    ======
+    ValueError
+        If the table can be neither given nor loaded, and no table_settings
+        are given to rebuild it.
+    """
+    if table is not None:
+        return table
+    problem = "is not given"
+    if table_file is not None:
+        try:
+            loaded = table_class.load(table_file)
+        except (OSError, EOFError, KeyError, ValueError, zipfile.BadZipFile) as exc:
+            problem = f"cannot be loaded ({exc!r})"
+        else:
+            if table_settings is None or loaded.settings() == table_settings:
+                return loaded
+            problem = "does not match table_settings"
+    if table_settings is None:
+        raise ValueError(
+            f"The inverse-CDF table {table_file!r} {problem}, "
+            "and no table_settings are given to rebuild it."
+        )
+    logger.warning(
+        f"The inverse-CDF table {table_file!r} {problem}; rebuilding it from table_settings."
+    )
+    return table_class(**table_settings)
+
+
+# ============================================================
+# p(chi_eff | q)
+#
+# In terms of u = (1 + q) |chi_eff| / a_max the density and the CDF are
+# piecewise closed-form on the regions
+#     q < 1/2:  A (0, q),      B (q, 1 - q),  D (1 - q, 1),  E (1, 1 + q)
+#     q > 1/2:  A (0, 1 - q),  C (1 - q, q),  D (q, 1),      E (1, 1 + q)
+
+
+# _FP_X returns (F, pdf) on region X.
+# F is a primitive (antiderivative) of 4q * pdf in chi_eff.  On A and B it is the
+# one vanishing at chi_eff = 0, G(u) = int_0^u H(u') du' with
+# pdf = (1 + q) H(u) / (4 q a_max); on C, D and E it is G + delta with
+# delta = _delta_at_1_q(q).  The CDF is 1/2 + sign(chi_eff) G / (4 q).
+# _FP_AB_at_q, _FP_CD_at_q and _FP_DE_at_1 return the same pair at the
+# region boundaries u = q and u = 1 (where the
+# region formulas contain 0 * log 0).  At u = 1 - q the formulas are regular,
+# so the region on its left (B for q < 1/2, A for q > 1/2) is used there.
+# ============================================================
+def _reli2_scalar(x):
+    """
+    Real part of the dilogarithm Li2(x) for a real scalar x.
+
+    Li2(x) = spence(1 - x) for x <= 1.
+    For x > 1 Li2 is complex and its real part follows from the inversion formula,
+        Re Li2(x) = pi^2 / 3 - log(x)^2 / 2 - Li2(1 / x).
+    Every dilogarithm in this module is real-part, so this single function is used everywhere.
+    """
+    if x <= 1.0:
+        return float(spence(1.0 - x))
+    return np.pi**2 / 3.0 - 0.5 * np.log(x) ** 2 - float(spence(1.0 - 1.0 / x))
+
+
+def _delta_at_1_q(q):
+    """Constant delta(q) by which the primitive F on C, D and E exceeds the one
+    vanishing at chi_eff = 0 (subtracted again in _cdf_pdf_chi_eff_scalar)."""
+    return 0.5 * (1.0 - q) ** 2 + 0.25 * np.log(q)
+
+
+def _FP_AB_at_q(q, a_max):
+    """(F, pdf) at u = q for q <= 1/2 (boundary of A and B), with F a primitive of 4 q pdf."""
+    log2q = np.log(2.0 * q)
+    F = q**2 * (4.5 - 2.0 * log2q - np.pi**2 / 8.0)
+    p = (1.0 + q) / (4.0 * a_max) * (4.0 - 2.0 * log2q - np.pi**2 / 4.0)
+    return float(F), float(p)
+
+
+def _FP_CD_at_q(q, a_max):
+    """(F, pdf) at u = q for q > 1/2 (boundary of C and D), with F a primitive of 4 q pdf.
+    Region C at u = q, with the 0 log 0 terms dropped and Li2(q / u) = Li2(1) = pi^2 / 6."""
+    if q == 1.0:
+        return 11.0 / 4.0 - np.pi**2 / 12.0, (1.0 / a_max) * (1.0 - np.pi**2 / 12.0)
+    q2, logq, log1mq = q * q, np.log(q), np.log1p(-q)
+    dilog = _reli2_scalar(1.0 - 1.0 / q) - np.pi**2 / 6.0
+    F = (
+        (-0.75 * q2 + q + 0.5 * q2 * logq) * logq
+        + (0.75 * q2 - q + 0.25) * log1mq
+        - 0.5 * q2 * logq * log1mq
+        + 0.5 * q2 * dilog
+        - 1.75 * q2
+        + 2.25 * (1.0 + q) * q
+    )
+    p = (
+        (1.0 + q)
+        / (4.0 * q * a_max)
+        * (
+            2.0
+            + (1.0 - q + q * logq) * logq
+            + (q - 1.0 - q * logq) * log1mq
+            + q * dilog
+        )
+    )
+    return float(F), float(p)
+
+
+def _FP_DE_at_1(q, a_max):
+    """(F, pdf) at u = 1 (boundary of D and E), with F a primitive of 4 q pdf."""
+    if q == 1.0:
+        return 11.0 / 4.0 - np.pi**2 / 12.0, (1.0 / a_max) * (1.0 - np.pi**2 / 12.0)
+    logq, log1mq, li2q = np.log(q), np.log1p(-q), _reli2_scalar(q)
+    F = (0.75 - q + 0.25 * q**2) * log1mq + 0.25 * logq - 0.5 * li2q + 0.5 + 2.25 * q
+    p = (1.0 + q) / (4.0 * q * a_max) * (2.0 * q + (1.0 - q) * log1mq - li2q)
+    return float(F), float(p)
+
+
+def _FP_A(u, q, a_max):
+    """(F, pdf) on region A, with F a primitive of 4 q pdf."""
+    s, d = q + u, q - u
+    logs, dlogd = np.log(s), d * np.log(d)
+    dilog = _reli2_scalar(-q / u) - _reli2_scalar(q / u)
+    F = (
+        -(0.75 * u * u + q * u + 0.25 * q * q) * logs
+        - 0.75 * (u - q / 3.0) * dlogd
+        + 0.5 * u * u * dilog
+        + 4.5 * q * u
+    )
+    p = (1.0 + q) / (4.0 * q * a_max) * (4.0 * q - s * logs - dlogd + u * dilog)
+    return float(F), float(p)
+
+
+def _FP_B(u, q, a_max):
+    """(F, pdf) on region B, with F a primitive of 4 q pdf."""
+    s, d = u + q, u - q
+    logs, dlogd = np.log(s), d * np.log(d)
+    dilog = _reli2_scalar(-q / u) - _reli2_scalar(q / u)
+    F = (
+        -(0.75 * u * u + q * u + 0.25 * q * q) * logs
+        + 0.75 * (u - q / 3.0) * dlogd
+        + 0.5 * u * u * dilog
+        + 4.5 * q * u
+    )
+    p = (1.0 + q) / (4.0 * q * a_max) * (4.0 * q - s * logs + dlogd + u * dilog)
+    return float(F), float(p)
+
+
+def _FP_C(u, q, a_max):
+    """(F, pdf) on region C, with F a primitive of 4 q pdf."""
+    u2, logu, logq = u * u, np.log(u), np.log(q)
+    log1mu, logqmu = np.log1p(-u), np.log(q - u)
+    dilog = _reli2_scalar(1.0 - 1.0 / u) - _reli2_scalar(q / u)
+    F = (
+        (-0.75 * u2 + u + 0.5 * u2 * logu) * logq
+        + (0.75 * u2 - u + 0.25) * log1mu
+        + (0.75 * u2 - q * u + 0.25 * q * q) * logqmu
+        - 0.5 * u2 * logu * log1mu
+        + 0.5 * u2 * dilog
+        - 1.75 * u2
+        + 2.25 * (1.0 + q) * u
+    )
+    p = (
+        (1.0 + q)
+        / (4.0 * q * a_max)
+        * (
+            2.0 * (1.0 + q - u)
+            + (1.0 - u + u * logu) * logq
+            + (u - 1.0 - u * logu) * log1mu
+            + (u - q) * logqmu
+            + u * dilog
+        )
+    )
+    return float(F), float(p)
+
+
+def _FP_D(u, q, a_max):
+    """(F, pdf) on region D, with F a primitive of 4 q pdf."""
+    u2, logu, logq = u * u, np.log(u), np.log(q)
+    log1mu, logumq = np.log1p(-u), np.log(u - q)
+    dilog = _reli2_scalar(1.0 - 1.0 / u) - _reli2_scalar(q / u)
+    F = (
+        (0.75 * u2 - q * u + 0.25 * q * q) * logumq
+        + (0.75 * u2 - u + 0.25) * log1mu
+        + (-0.75 * u2 + 0.5 * u2 * logu) * logq
+        - 0.5 * u2 * logu * log1mu
+        + 0.5 * u2 * dilog
+        + (2.25 * (1.0 + q) + logq) * u
+        - 1.75 * u2
+    )
+    p = (
+        (1.0 + q)
+        / (4.0 * q * a_max)
+        * (
+            2.0 * (1.0 + q - u)
+            + (1.0 - u + u * logu) * logq
+            + (u - 1.0 - u * logu) * log1mu
+            + (u - q) * logumq
+            + u * dilog
+        )
+    )
+    return float(F), float(p)
+
+
+def _FP_E(u, q, a_max):
+    """(F, pdf) on region E, with F a primitive of 4 q pdf."""
+    u2, logu, logq = u * u, np.log(u), np.log(q)
+    logum1, logumq = np.log(u - 1.0), np.log(u - q)
+    dilog = _reli2_scalar(1.0 - 1.0 / u) - _reli2_scalar(q / u)
+    F = (
+        (0.75 * u2 - u + 0.25) * logum1
+        + (-0.75 * u2 + 0.5 * u2 * logu + u) * logq
+        + (0.75 * u2 - q * u + 0.25 * q * q) * logumq
+        - 0.5 * u2 * logu * logum1
+        + 0.5 * u2 * dilog
+        + 2.25 * (1.0 + q) * u
+        - 1.75 * u2
+    )
+    p = (
+        (1.0 + q)
+        / (4.0 * q * a_max)
+        * (
+            2.0 * (1.0 + q - u)
+            + (1.0 - u + u * logu) * logq
+            + (u - 1.0 - u * logu) * logum1
+            + (u - q) * logumq
+            + u * dilog
+        )
+    )
+    return float(F), float(p)
+
+
+def _cdf_pdf_chi_eff_scalar(chi_eff, q, a_max):
+    """Return the scalar (CDF, PDF) of p(chi_eff | q), sharing the special functions."""
+    if chi_eff <= -a_max:
+        return 0.0, 0.0
+    if chi_eff >= a_max:
+        return 1.0, 0.0
+    if chi_eff == 0.0:
+        # cdf = 1/2 and pdf = p(0) on region A
+        pdf = (1.0 + q) / (2.0 * a_max) * (2.0 - np.log(q))
+        return 0.5, float(pdf)
+
+    # Regions in increasing u.  At the boundaries u = q and u = 1 the region
+    # formulas contain 0 log 0, so the boundary values are used there.
+    u = (1.0 + q) * abs(chi_eff) / a_max
+    if q <= 0.5:  # A (0, q), B (q, 1 - q), D (1 - q, 1), E (1, 1 + q)
+        if u < q:
+            cumulative, pdf = _FP_A(u, q, a_max)
+        elif u == q:
+            cumulative, pdf = _FP_AB_at_q(q, a_max)
+        elif u <= 1.0 - q:
+            cumulative, pdf = _FP_B(u, q, a_max)
+        elif u < 1.0:
+            cumulative, pdf = _FP_D(u, q, a_max)
+        elif u == 1.0:
+            cumulative, pdf = _FP_DE_at_1(q, a_max)
+        else:
+            cumulative, pdf = _FP_E(u, q, a_max)
+    else:  # A (0, 1 - q), C (1 - q, q), D (q, 1), E (1, 1 + q)
+        if u <= 1.0 - q:
+            cumulative, pdf = _FP_A(u, q, a_max)
+        elif u < q:
+            cumulative, pdf = _FP_C(u, q, a_max)
+        elif u == q:
+            cumulative, pdf = _FP_CD_at_q(q, a_max)
+        elif u < 1.0:
+            cumulative, pdf = _FP_D(u, q, a_max)
+        elif u == 1.0:
+            cumulative, pdf = _FP_DE_at_1(q, a_max)
+        else:
+            cumulative, pdf = _FP_E(u, q, a_max)
+    # On C, D and E (u > 1 - q) the primitive is shifted by delta(q)
+    if u > 1.0 - q:
+        cumulative -= _delta_at_1_q(q)
+
+    cdf = 0.5 + np.sign(chi_eff) * cumulative / (4.0 * q)
+    return float(min(max(cdf, 0.0), 1.0)), float(max(pdf, 0.0))
+
+
+# Element-wise versions of the scalar formulas (as bilby's conversion module
+# does for scalar-only LAL functions).
+_cdf_chi_eff_vectorized = np.vectorize(
+    lambda chi_eff, q, a_max: _cdf_pdf_chi_eff_scalar(
+        float(chi_eff), float(q), float(a_max)
+    )[0],
+    otypes=[float],
+)
+_pdf_chi_eff_vectorized = np.vectorize(
+    lambda chi_eff, q, a_max: _cdf_pdf_chi_eff_scalar(
+        float(chi_eff), float(q), float(a_max)
+    )[1],
+    otypes=[float],
+)
+
+
+def _cdf_chi_eff(chi_eff, q, a_max):
+    """CDF of chi_eff given the mass ratio (0 < q <= 1); broadcasts over chi_eff and q."""
+    return _cdf_chi_eff_vectorized(chi_eff, q, a_max)[()]
+
+
+def _pdf_chi_eff(chi_eff, q, a_max):
+    """Probability density of chi_eff given the mass ratio (0 < q <= 1); broadcasts over chi_eff and q."""
+    out = _pdf_chi_eff_vectorized(chi_eff, q, a_max)[()]
+    if not np.all(np.isfinite(out)):
+        raise FloatingPointError("_pdf_chi_eff produced a non-finite density.")
+    return out
+
+
+class ChieffTable:
+    """
+    Class for building or loading Inverse-CDF table of p(chi_eff | q).
+    """
+
+    def __init__(self, q_min, q_max, a_max, n_q=200, n_u=1025, dtype=np.float64):
+        """
+        Parameters
+        ==========
+        q_min, q_max: float
+            Range of the mass-ratio grid.
+        a_max: float
+            Maximum spin magnitude; chi_eff takes values in [-a_max, a_max].
+        n_q, n_u: int, optional
+            Number of points of the q grid and of the u grid.
+        dtype: numpy dtype, optional
+            dtype of the stored inverse table.
+        """
+        self.q_min = float(q_min)
+        self.q_max = float(q_max)
+        self.a_max = float(a_max)
+        self.n_q = n_q
+        self.n_u = n_u
+        self.dtype = dtype
+        self.q_grid = np.linspace(self.q_min, self.q_max, int(n_q))
+        self.u_grid = np.linspace(0.0, 1.0, self.n_u)
+        self.inv_table = np.empty((self.n_q, self.n_u), dtype=self.dtype)
+        self.filename = None  # set by save / load; stored in the prior JSON
+        self.build_table()
+
+    def build_table(self):
+        """For each q, tabulate the CDF on a uniform chi_eff grid (monotonic, from 0 to 1)
+        and invert it onto the uniform u grid."""
+        chi_eff_grid = -self.a_max + 2.0 * self.a_max * self.u_grid
+        for i, q in enumerate(self.q_grid):
+            F = np.asarray(_cdf_chi_eff(chi_eff_grid, q, self.a_max), dtype=float)
+            F[0], F[-1] = 0.0, 1.0
+            F = np.maximum.accumulate(np.clip(F, 0.0, 1.0))
+            self.inv_table[i] = np.interp(self.u_grid, F, chi_eff_grid)
+
+    def guess(self, u, q):
+        """Initial guess of the inverse CDF: bilinear interpolation of the inverse
+        table in (q, u) from 4 table values (both grids are uniform)."""
+        qg = self.q_grid
+        nq = len(qg)
+        qc = min(max(q, qg[0]), qg[-1])
+        fi = (qc - qg[0]) / (qg[-1] - qg[0]) * (nq - 1)
+        i = min(int(fi), nq - 2)
+        wq = fi - i
+        fk = min(max(u, 0.0), 1.0) * (self.n_u - 1)
+        k = min(int(fk), self.n_u - 2)
+        wu = fk - k
+        r0, r1 = self.inv_table[i], self.inv_table[i + 1]
+        return float(
+            (1.0 - wq) * ((1.0 - wu) * r0[k] + wu * r0[k + 1])
+            + wq * ((1.0 - wu) * r1[k] + wu * r1[k + 1])
+        )
+
+    def settings(self):
+        """Arguments of __init__ that rebuild this table (stored in the prior JSON)."""
+        return dict(
+            q_min=float(self.q_min),
+            q_max=float(self.q_max),
+            a_max=float(self.a_max),
+            n_q=len(self.q_grid),
+            n_u=len(self.u_grid),
+            dtype=np.dtype(self.inv_table.dtype).name,
+        )
+
+    def save(self, filename):
+        """Save the table to a .npz file."""
+        np.savez(
+            filename,
+            format_version=3,
+            q_min=self.q_min,
+            q_max=self.q_max,
+            a_max=self.a_max,
+            q_grid=self.q_grid,
+            u_grid=self.u_grid,
+            inv_table=self.inv_table,
+        )
+        self.filename = os.fspath(filename)
+
+    @classmethod
+    def load(cls, filename):
+        """Load a table written by ``save``."""
+        with np.load(filename, allow_pickle=False) as data:
+            if "inv_table" not in data.files:
+                raise ValueError(
+                    f"{filename} is an old incompatible chi_eff table (no inv_table). "
+                    "Delete it and rebuild the table."
+                )
+            obj = cls.__new__(cls)
+            obj.q_min = float(data["q_min"])
+            obj.q_max = float(data["q_max"])
+            obj.a_max = float(data["a_max"])
+            obj.q_grid = np.asarray(data["q_grid"], dtype=float).copy()
+            obj.u_grid = np.asarray(data["u_grid"], dtype=float).copy()
+            obj.inv_table = np.asarray(data["inv_table"]).copy()
+
+        obj.filename = os.fspath(filename)
+        obj.dtype = obj.inv_table.dtype
+        obj.n_q = len(obj.q_grid)
+        obj.n_u = len(obj.u_grid)
+        expected_shape = (obj.n_q, obj.n_u)
+        if obj.inv_table.shape != expected_shape:
+            raise ValueError(
+                f"Invalid chi_eff table shape {obj.inv_table.shape}; "
+                f"expected {expected_shape}."
+            )
+        return obj
+
+
+class ConditionalIsotropicChieffPrior(ConditionalBasePrior):
+    r"""
+    Conditional prior for the effective spin chi_eff given the mass ratio q,
+    for isotropic spins with magnitudes uniform in [0, a_max]:
+
+    .. math::
+
+        \pi(\chi_{\rm eff} | q) \propto \int d\chi_{1z} \int d\chi_{2z}
+        \log\frac{a_{\max}}{|\chi_{1z}|} \log\frac{a_{\max}}{|\chi_{2z}|}
+        \delta\left(\chi_{\rm eff} - \frac{\chi_{1z} + q \chi_{2z}}{1 + q}\right),
+
+    on |chi_1z|, |chi_2z| <= a_max.
+    The PDF and CDF are piecewise analytic."""
+
+    def __init__(
+        self,
+        table=None,
+        name="chi_eff",
+        latex_label=r"$\chi_{\rm eff}$",
+        unit=None,
+        boundary=None,
+        n_newton=5,
+        table_file=None,
+        table_settings=None,
+    ):
+        """
+        Parameters
+        ==========
+        table: ChieffTable
+            Inverse-CDF table for the initial guess. If None, it is loaded from
+            ``table_file`` or rebuilt from ``table_settings``.
+        name: str
+            See superclass
+        latex_label: str
+            See superclass
+        unit: str
+            See superclass
+        boundary: str
+            See superclass
+        n_newton: int, optional
+            Maximum number of Newton steps.
+        table_file: str, optional
+            Path of the saved table (stored in the prior JSON).
+        table_settings: dict, optional
+            table.settings(), used to rebuild the table if ``table_file`` is
+            missing or broken (stored in the prior JSON).
+        """
+        table = _table_for_prior(table, table_file, ChieffTable, table_settings)
+        self.table = table
+        if table_file is None:
+            table_file = table.filename
+        self.table_file = os.path.abspath(os.fspath(table_file))
+        self.table_settings = table.settings()
+        self.a_max = table.a_max
+        self._current_mass_ratio = None
+        self.n_newton = n_newton
+        self.scalar_types = (float, int, np.floating, np.integer)
+        super().__init__(
+            minimum=-self.a_max,
+            maximum=self.a_max,
+            name=name,
+            latex_label=latex_label,
+            unit=unit,
+            boundary=boundary,
+            condition_func=self._condition_function,
+        )
+
+        self.__class__.__name__ = "ConditionalIsotropicChieffPrior"
+        self.__class__.__qualname__ = "ConditionalIsotropicChieffPrior"
+
+    def _condition_function(self, reference_params, mass_ratio):
+        """Cache the mass ratio"""
+        self._current_mass_ratio = np.asarray(mass_ratio, dtype=float)
+        return dict(minimum=-self.a_max, maximum=self.a_max)
+
+    def _get_conditions(self, required_variables):
+        """Update the conditions with bilby's update_conditions (which also caches
+        the mass ratio in _condition_function) and return the mass ratio."""
+        self.update_conditions(**required_variables)
+        if self._current_mass_ratio is None:
+            raise KeyError("No cached mass_ratio found.")
+        return self._current_mass_ratio
+
+    def prob(self, val, *, xp=np, **rv):
+        """Return the prior probability of val."""
+        return _pdf_chi_eff(val, self._get_conditions(rv), self.a_max)
+
+    def ln_prob(self, val, *, xp=np, **rv):
+        """Return the log prior probability of val."""
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.log(self.prob(val, **rv))
+
+    def cdf(self, val, *, xp=np, **rv):
+        """Return the cumulative distribution function at val."""
+        return _cdf_chi_eff(val, self._get_conditions(rv), self.a_max)
+
+    def _icdf(self, u, q):
+        """Inverse CDF at one point (Python floats u, q): table guess, Newton, and Brent if needed."""
+        a = self.a_max
+        if u <= 0.0:
+            return -a
+        if u >= 1.0:
+            return a
+
+        def cdf_pdf(x):
+            return _cdf_pdf_chi_eff_scalar(x, q, a)
+
+        xk, F, converged = _newton_update(
+            self.table.guess(u, q), u, -a, a, cdf_pdf, self.n_newton
+        )
+        if not converged:
+            xk = _brent_update(xk, F, u, -a, a, lambda x: cdf_pdf(x)[0])
+        return min(max(xk, -a), a)
+
+    def rescale(self, val, *, xp=np, **rv):
+        """Map a sample from the unit interval to the prior (inverse CDF).
+        Scalars (as from dynesty) call _icdf directly; arrays go through np.vectorize."""
+        if isinstance(val, self.scalar_types) and isinstance(
+            rv.get("mass_ratio"), self.scalar_types
+        ):
+            u, q = float(val), float(rv["mass_ratio"])
+            self._current_mass_ratio = q
+            return self._icdf(u, q)
+        q = self._get_conditions(rv)
+        val = np.asarray(val, dtype=float)
+        icdf = np.vectorize(
+            lambda uu, qq: self._icdf(float(uu), float(qq)), otypes=[float]
+        )
+        return icdf(val, q)[()]
+
+    def get_instantiation_dict(self):
+        instantiation_dict = Prior.get_instantiation_dict(self)
+        instantiation_dict.pop("table")
+        return instantiation_dict
+
+    def __repr__(self):
+        return Prior.__repr__(self)
+
+
+# ============================================================
+# p(chi_2 | chi_eff, q)
+#
+# With chi_1z = (1 + q) chi_eff - q chi_2 the density is proportional to
+# log(a_max / |chi_1z|) log(a_max / |chi_2|) on |chi_1z|, |chi_2| <= a_max.
+# In t = chi_2 / a_max and alpha = (1 + q) chi_eff / a_max it is
+# log|t| log|alpha - q t|, with the antiderivative _func_scalar.
+#
+# _chi2_precompute collects everything that does not depend on chi_2 (support,
+# normalisation, series coefficients), so that the table rows and the
+# inverse-CDF iterations compute it once per (chi_eff, q);
+# _cdf_pdf_chi2_scalar then returns (CDF, PDF) at one chi_2.
+# ============================================================
+
+
+def _reli2_for_table(x):
+    """Array version of _reli2_scalar (real part of Li2), for building the table:
+    spence(1 - x) for x <= 1, and the inversion formula for x > 1."""
+    x = np.asarray(x, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        inverted = (
+            np.pi**2 / 3.0 - 0.5 * np.log(np.abs(x)) ** 2 - spence(1.0 - 1.0 / x)
+        )  # Re Li2(x) for x > 1
+    return np.where(x <= 1.0, spence(1.0 - x), inverted)
+
+
+def _func_for_table(t, alpha, q):
+    """Array version of _func_scalar (t an array, alpha and q scalars), for building the table."""
+    t = np.asarray(t, dtype=float)
+    t0 = alpha / q
+    with np.errstate(divide="ignore", invalid="ignore"):
+        tlogt = np.where(t == 0.0, 0.0, t * np.log(np.abs(t)))  # t log|t|
+        if abs(t0) < 1e-300:  # In case of chi_eff = 0
+            return (
+                (tlogt - t) * np.log(np.maximum(np.abs(q * t), 1e-300))
+                - tlogt
+                + 2.0 * t
+            )
+        tau = alpha - q * t
+        dh = tlogt - t + t0 - t0 * np.log(abs(t0))  # h(t) - h(t0)
+        log_term = np.where(tau == 0.0, 0.0, dh * np.log(np.abs(tau)))
+    return log_term - tlogt + 2.0 * t + t0 * _reli2_for_table(1.0 - t / t0)
+
+
+def _cdf_chi2_for_table(chi2, pre):
+    """CDF of chi_2 over an array chi2 for one tuple from _chi2_precompute
+    (array version of _cdf_pdf_chi2_scalar(...)[0], for the table)."""
+    kind, lower, upper = pre[0], pre[1], pre[2]
+    chi2 = np.asarray(chi2, dtype=float)
+    if kind == "point":
+        return np.where(chi2 >= 0.5 * (lower + upper), 1.0, 0.0)
+    inside = (chi2 > lower) & (chi2 < upper)
+    F = np.zeros_like(chi2)
+    if kind == "narrow":
+        _, _, _, width, coef, coef_beta, ps, p1, pdf_scale = pre
+        s = (chi2[inside] - lower) / width
+        F[inside] = coef_beta @ betainc(
+            ps[:, None] + 1.0, p1[:, None] + 1.0, s[None, :]
+        )
+    else:
+        _, _, _, alpha, q, a_max, P0, span = pre
+        F[inside] = (_func_for_table(chi2[inside] / a_max, alpha, q) - P0) / span
+    F[chi2 >= upper] = 1.0
+    return np.clip(F, 0.0, 1.0)
+
+
+def _func_scalar(t, alpha, q):
+    """
+    Antiderivative F(t) of log|t| log|alpha - q t| (unnormalised CDF of chi_2):
+
+        F(t) = [h(t) - h(t0)] log|alpha - q t| - t log|t| + 2 t + t0 Re Li2(1 - t / t0),
+
+    where
+        t0 = alpha / q,
+        h(x) = x log|x| - x.
+
+    In case of t0 = 0 (chi_eff = 0), F(t) uses the limit F(t) = h(t) log|q t| - t log|t| + 2 t,
+    and 0 log 0 is taken as 0.
+    """
+    tlogt = t * np.log(abs(t)) if t != 0.0 else 0.0  # t log|t|
+    t0 = alpha / q
+
+    if abs(t0) < 1e-300:  # In case of chi_eff = 0
+        return float((tlogt - t) * np.log(max(abs(q * t), 1e-300)) - tlogt + 2.0 * t)
+
+    tau = alpha - q * t
+    dh = tlogt - t + t0 - t0 * np.log(abs(t0))  # h(t) - h(t0)
+    log_term = dh * np.log(abs(tau)) if tau != 0.0 else 0.0
+    return float(log_term - tlogt + 2.0 * t + t0 * _reli2_scalar(1.0 - t / t0))
+
+
+def _chi2_support_scalar(chi_eff, q, a_max):
+    """Support (lower, upper) of chi_2 given chi_eff and q: |chi_2|, |chi_1z| <= a_max."""
+    s = (1.0 + q) * chi_eff
+    return max(-a_max, (s - a_max) / q), min(a_max, (s + a_max) / q)
+
+
+_chi2_support_vectorized = np.vectorize(
+    lambda chi_eff, q, a_max: _chi2_support_scalar(
+        float(chi_eff), float(q), float(a_max)
+    ),
+    otypes=[float, float],
+)
+
+
+# p(chi_2 | chi_eff, q): with support width w, A = w / a_max and
+# B = (1 + q)(1 - |chi_eff| / a_max) (= q A), the CDF/PDF use
+#   "point"  if w <= CHI2_DEGENERATE_REL_TOL * a_max  (step CDF, PDF = 0),
+#   "narrow" if max(A, B) <= CHI2_EDGE_SERIES_MAX_ARGUMENT  (Beta series),
+#   "wide"   otherwise  (analytic antiderivative).
+CHI2_DEGENERATE_REL_TOL = 64.0 * np.finfo(float).eps  # chi_eff = +-a_max up to rounding
+# The analytic CDF loses accuracy as the support narrows (~3e-12 at A = 0.25);
+# the order-16 series has error ~2e-13 (CDF) and ~1e-11 (PDF, relative) there.
+# Re-validate both values against mpmath when changing either.
+CHI2_EDGE_SERIES_MAX_ARGUMENT = 0.25
+CHI2_EDGE_SERIES_ORDER = 16
+# Terms of sum_{m,n=1}^{N} A^m B^n / (m n) s^ps (1 - s)^p1 with s = (chi_2 - lower) / w,
+# (ps, p1) = (n, m) for chi_eff >= 0 and (m, n) otherwise; Beta(ps + 1, p1 + 1) is symmetric.
+_SERIES_M, _SERIES_N = (
+    x.ravel().astype(float)
+    for x in np.meshgrid(
+        np.arange(1, CHI2_EDGE_SERIES_ORDER + 1),
+        np.arange(1, CHI2_EDGE_SERIES_ORDER + 1),
+        indexing="ij",
+    )
+)
+_SERIES_BETA = beta_function(_SERIES_M + 1.0, _SERIES_N + 1.0)
+
+
+def _chi2_precompute(chi_eff, q, a_max):
+    """Precompute the parts of the chi_2 CDF/PDF that do not depend on chi_2.
+
+    The support [lower, upper] of chi_2 given (chi_eff, q) falls into one of 3 cases below:
+
+    "point":  the support has (numerically) zero width, width <= CHI2_DEGENERATE_REL_TOL * a_max
+              (e.g. chi_eff = +-a_max).
+    "narrow": the support is narrow (e.g. |chi_eff| close to a_max).
+              The CDF/PDF are evaluated with the truncated double Beta series for numerical stability.
+    "wide":   otherwise. The CDF is evaluated with the analytic antiderivative (_func_scalar).
+
+    Returns
+    -------
+    ("point", lower, upper)
+    ("narrow", lower, upper, width, coef, coef_beta / normalization, ps, p1, 1 / (width * normalization))
+    ("wide", lower, upper, alpha, q, a_max, F0, F_width)
+    """
+    lower, upper = _chi2_support_scalar(chi_eff, q, a_max)
+    width = upper - lower
+    if not width > CHI2_DEGENERATE_REL_TOL * a_max:
+        return ("point", lower, upper)
+    A = width / a_max
+    B = (1.0 + q) * max(0.0, 1.0 - abs(chi_eff) / a_max)
+    if max(A, B) <= CHI2_EDGE_SERIES_MAX_ARGUMENT:
+        coef = A**_SERIES_M * B**_SERIES_N / (_SERIES_M * _SERIES_N)
+        coef_beta = coef * _SERIES_BETA
+        normalization = float(np.sum(coef_beta))
+        if not np.isfinite(normalization):
+            raise FloatingPointError(
+                "Failed to normalize the narrow-support chi_2 series."
+            )
+        ps, p1 = (_SERIES_N, _SERIES_M) if chi_eff >= 0.0 else (_SERIES_M, _SERIES_N)
+        return (
+            "narrow",
+            lower,
+            upper,
+            width,
+            coef,
+            coef_beta / normalization,
+            ps,
+            p1,
+            1.0 / (width * normalization),
+        )
+    alpha = (1.0 + q) * chi_eff / a_max
+    F0 = _func_scalar(lower / a_max, alpha, q)
+    F1 = _func_scalar(upper / a_max, alpha, q)
+    F_width = F1 - F0
+    if not np.isfinite(F_width):
+        raise FloatingPointError(
+            f"Failed to compute the normalization of p(chi2 | chi_eff={chi_eff}, q={q})."
+        )
+    return ("wide", lower, upper, alpha, q, a_max, F0, F_width)
+
+
+def _cdf_pdf_chi2_scalar(chi2, pre):
+    """Return the scalar (CDF, PDF) of chi_2z, where
+    pre = _chi2_precompute(chi_eff, q, a_max) holds the parts that depend only
+    on (chi_eff, q).  The logarithmic singularities of the density at
+    chi_2z = 0 or chi_1z = 0 are represented as zero (a measure-zero convention)."""
+    kind, lower, upper = pre[0], pre[1], pre[2]
+
+    if kind == "point":  # In case of degenerate support
+        return (1.0 if chi2 >= 0.5 * (lower + upper) else 0.0), 0.0
+    if chi2 <= lower:
+        return 0.0, 0.0
+    if chi2 >= upper:
+        return 1.0, 0.0
+
+    if kind == "narrow":  # In case of narrow support
+        _, _, _, width, coef, coef_beta, ps, p1, pdf_scale = pre
+        s = (chi2 - lower) / width
+        F = float(np.dot(coef_beta, betainc(ps + 1.0, p1 + 1.0, s)))
+        pdf = float(np.dot(coef, s**ps * (1.0 - s) ** p1)) * pdf_scale
+
+    elif kind == "wide":  # In case of wide support(usual case)
+        _, _, _, alpha, q, a_max, F0, F_width = pre
+        t = chi2 / a_max
+        tau = alpha - q * t
+        F = (_func_scalar(t, alpha, q) - F0) / F_width
+        pdf = (
+            0.0
+            if t == 0.0 or tau == 0.0
+            else np.log(abs(t)) * np.log(abs(tau)) / (a_max * F_width)
+        )
+
+    return float(min(max(F, 0.0), 1.0)), float(max(pdf, 0.0))
+
+
+# Element-wise versions of the scalar formulas (as for chi_eff above).
+_cdf_chi2_vectorized = np.vectorize(
+    lambda chi2, chi_eff, q, a_max: _cdf_pdf_chi2_scalar(
+        float(chi2), _chi2_precompute(float(chi_eff), float(q), float(a_max))
+    )[0],
+    otypes=[float],
+)
+_pdf_chi2_vectorized = np.vectorize(
+    lambda chi2, chi_eff, q, a_max: _cdf_pdf_chi2_scalar(
+        float(chi2), _chi2_precompute(float(chi_eff), float(q), float(a_max))
+    )[1],
+    otypes=[float],
+)
+
+
+def _cdf_chi2(chi2, chi_eff, q, a_max):
+    """CDF of chi_2 given chi_eff and the mass ratio; broadcasts over chi2, chi_eff and q."""
+    return _cdf_chi2_vectorized(chi2, chi_eff, q, a_max)[()]
+
+
+def _pdf_chi2(chi2, chi_eff, q, a_max):
+    """Probability density of chi_2 given chi_eff and the mass ratio; broadcasts over chi2, chi_eff and q."""
+    out = _pdf_chi2_vectorized(chi2, chi_eff, q, a_max)[()]
+    if not np.all(np.isfinite(out)):
+        raise FloatingPointError("_pdf_chi2 produced a non-finite density.")
+    return out
+
+
+class Chi2zTable:
+    """
+    Class for building or loading Inverse-CDF table of p(chi_2z | chi_eff, q).
+    """
+
+    def __init__(
+        self, q_min, q_max, a_max, n_q=120, n_chieff=301, n_u=801, dtype=np.float32
+    ):
+        """
+        Parameters
+        ==========
+        q_min, q_max: float
+            Range of the mass-ratio grid.
+        a_max: float
+            Maximum spin magnitude; the chi_eff grid covers [-a_max, a_max].
+        n_q, n_chieff, n_u: int, optional
+            Number of points of the q, chi_eff and u grids.
+        dtype: numpy dtype, optional
+            dtype of the stored inverse table (default: float32).
+        """
+        self.q_min = float(q_min)
+        self.q_max = float(q_max)
+        self.a_max = float(a_max)
+        self.n_q = n_q
+        self.n_chieff = n_chieff
+        self.n_u = n_u
+        self.dtype = dtype
+        self.q_grid = np.linspace(self.q_min, self.q_max, int(n_q))
+        self.chieff_grid = np.linspace(-self.a_max, self.a_max, int(n_chieff))
+        self.u_grid = np.linspace(0.0, 1.0, self.n_u)
+        self.inv_table = np.empty((self.n_q, self.n_chieff, self.n_u), dtype=self.dtype)
+        self.filename = None  # set by save / load; stored in the prior JSON
+        self.build_table()
+
+    def build_table(self):
+        """For each (q, chi_eff), tabulate the CDF on the uniform s grid (monotonic,
+        from 0 to 1) and invert it onto the uniform u grid.  At |chi_eff| = a_max
+        the support degenerates; its rows use the limiting shape 3 s^2 - 2 s^3 of
+        the Beta series."""
+        for i, q in enumerate(self.q_grid):
+            if i % max(1, len(self.q_grid) // 10) == 0:
+                logger.info(f"Building chi_2 table: q row {i + 1}/{len(self.q_grid)}")
+            for j, chi_eff in enumerate(self.chieff_grid):
+                pre = _chi2_precompute(chi_eff, q, self.a_max)
+                if pre[0] == "point":
+                    # Degenerate support (|chi_eff| = a_max): use the limiting shape of the
+                    # Beta series in s, 3 s^2 - 2 s^3, so that the table is continuous in chi_eff.
+                    F_row = 3.0 * self.u_grid**2 - 2.0 * self.u_grid**3
+                else:
+                    lower, upper = pre[1], pre[2]
+                    chi2_grid = lower + (upper - lower) * self.u_grid
+                    F_row = np.maximum.accumulate(
+                        np.clip(_cdf_chi2_for_table(chi2_grid, pre), 0.0, 1.0)
+                    )
+                F_row[0] = 0.0
+                F_row[-1] = 1.0
+                self.inv_table[i, j, :] = np.interp(self.u_grid, F_row, self.u_grid)
+
+    @staticmethod
+    def _frac_index(x, grid):
+        """Return (i, w) with x = (1 - w) grid[i] + w grid[i + 1] on a uniform grid, x clipped to the grid."""
+        n = len(grid)
+        xc = min(max(x, grid[0]), grid[-1])
+        f = (xc - grid[0]) / (grid[-1] - grid[0]) * (n - 1)
+        i = min(int(f), n - 2)
+        return i, f - i
+
+    def guess(self, u, chi_eff, q):
+        """Initial guess of the inverse CDF:
+        trilinear interpolation of the inverse table in (q, chi_eff, u) from 8 table values."""
+        i, wq = self._frac_index(q, self.q_grid)
+        j, wc = self._frac_index(chi_eff, self.chieff_grid)
+        fk = min(max(u, 0.0), 1.0) * (self.n_u - 1)
+        k = min(int(fk), self.n_u - 2)
+        wu = fk - k
+        T = self.inv_table
+
+        def lin(r):
+            return (1.0 - wu) * float(r[k]) + wu * float(r[k + 1])
+
+        return (1.0 - wq) * ((1.0 - wc) * lin(T[i, j]) + wc * lin(T[i, j + 1])) + wq * (
+            (1.0 - wc) * lin(T[i + 1, j]) + wc * lin(T[i + 1, j + 1])
+        )
+
+    def settings(self):
+        """Arguments of __init__ that rebuild this table (stored in the prior JSON)."""
+        return dict(
+            q_min=float(self.q_min),
+            q_max=float(self.q_max),
+            a_max=float(self.a_max),
+            n_q=len(self.q_grid),
+            n_chieff=len(self.chieff_grid),
+            n_u=len(self.u_grid),
+            dtype=np.dtype(self.inv_table.dtype).name,
+        )
+
+    def save(self, filename):
+        """Save the table to a .npz file."""
+        np.savez(
+            filename,
+            format_version=3,
+            q_min=self.q_min,
+            q_max=self.q_max,
+            a_max=self.a_max,
+            q_grid=self.q_grid,
+            chieff_grid=self.chieff_grid,
+            u_grid=self.u_grid,
+            inv_table=self.inv_table,
+        )
+        self.filename = os.fspath(filename)
+
+    @classmethod
+    def load(cls, filename):
+        """Load a table written by ``save``."""
+        with np.load(filename, allow_pickle=False) as data:
+            if "inv_table" not in data.files:
+                raise ValueError(
+                    f"{filename} is an old incompatible chi_2 table (no inv_table). "
+                    "Delete it and rebuild the table."
+                )
+            obj = cls.__new__(cls)
+            obj.q_min = float(data["q_min"])
+            obj.q_max = float(data["q_max"])
+            obj.a_max = float(data["a_max"])
+            obj.q_grid = np.asarray(data["q_grid"], dtype=float).copy()
+            obj.chieff_grid = np.asarray(data["chieff_grid"], dtype=float).copy()
+            obj.u_grid = np.asarray(data["u_grid"], dtype=float).copy()
+            obj.inv_table = np.asarray(data["inv_table"]).copy()
+
+        obj.filename = os.fspath(filename)
+        obj.dtype = obj.inv_table.dtype
+        obj.n_q = len(obj.q_grid)
+        obj.n_chieff = len(obj.chieff_grid)
+        obj.n_u = len(obj.u_grid)
+        expected_shape = (obj.n_q, obj.n_chieff, obj.n_u)
+        if obj.inv_table.shape != expected_shape:
+            raise ValueError(
+                f"Invalid chi_2 table shape {obj.inv_table.shape}; "
+                f"expected {expected_shape}."
+            )
+        return obj
+
+
+class ConditionalIsotropicChi2zPrior(ConditionalBasePrior):
+    r"""
+    Conditional prior for the aligned spin component chi_2z given chi_eff and
+    mass ratio, for isotropic spins with magnitudes uniform in [0, a_max]:
+
+    .. math::
+
+        \pi(\chi_{2z} | \chi_{\rm eff}, q)
+        \propto \log\frac{a_{\max}}{|\chi_{1z}|} \log\frac{a_{\max}}{|\chi_{2z}|},
+        \qquad \chi_{1z} = (1 + q) \chi_{\rm eff} - q \chi_{2z},
+
+    on |chi_1z|, |chi_2z| <= a_max.
+    """
+
+    def __init__(
+        self,
+        table=None,
+        name="chi_2",
+        latex_label=r"$\chi_2$",
+        unit=None,
+        boundary=None,
+        n_newton=5,
+        table_file=None,
+        table_settings=None,
+    ):
+        """
+        Parameters
+        ==========
+        table: Chi2zTable
+            Inverse-CDF table for the initial guess. If None, it is loaded from
+            ``table_file`` (or rebuilt from ``table_settings``).
+        name: str
+            See superclass
+        latex_label: str
+            See superclass
+        unit: str
+            See superclass
+        boundary: str
+            See superclass
+        n_newton: int, optional
+            Maximum number of Newton steps.
+        table_file: str, optional
+            Path of the saved table (stored in the prior JSON).
+        table_settings: dict, optional
+            table.settings(), used to rebuild the table if ``table_file`` is
+            missing or broken (stored in the prior JSON).
+        """
+        table = _table_for_prior(table, table_file, Chi2zTable, table_settings)
+        self.table = table
+        if table_file is None:
+            table_file = table.filename
+        self.table_file = os.path.abspath(os.fspath(table_file))
+        self.table_settings = table.settings()
+        self.a_max = table.a_max
+        self._current_chi_eff = None
+        self._current_mass_ratio = None
+        self.n_newton = n_newton
+        self.scalar_types = (float, int, np.floating, np.integer)
+        super().__init__(
+            minimum=-self.a_max,
+            maximum=self.a_max,
+            name=name,
+            latex_label=latex_label,
+            unit=unit,
+            boundary=boundary,
+            condition_func=self._condition_function,
+        )
+
+        self.__class__.__name__ = "ConditionalIsotropicChi2zPrior"
+        self.__class__.__qualname__ = "ConditionalIsotropicChi2zPrior"
+
+    def _condition_function(self, reference_params, chi_eff, mass_ratio):
+        """Cache (chi_eff, mass_ratio) and return the support of chi_2."""
+        chi_eff = np.asarray(chi_eff, dtype=float)
+        q = np.asarray(mass_ratio, dtype=float)
+        self._current_chi_eff = chi_eff
+        self._current_mass_ratio = q
+        lower, upper = _chi2_support_vectorized(chi_eff, q, self.a_max)
+        return dict(minimum=lower, maximum=upper)
+
+    def _get_conditions(self, required_variables):
+        """Update the conditions with bilby's update_conditions (which also caches
+        chi_eff and the mass ratio in _condition_function) and return them."""
+        self.update_conditions(**required_variables)
+        if self._current_chi_eff is None or self._current_mass_ratio is None:
+            raise KeyError("No cached chi_eff / mass_ratio found.")
+        return self._current_chi_eff, self._current_mass_ratio
+
+    def prob(self, val, *, xp=np, **rv):
+        """Return the prior probability of val."""
+        chi_eff, q = self._get_conditions(rv)
+        return _pdf_chi2(val, chi_eff, q, self.a_max)
+
+    def ln_prob(self, val, *, xp=np, **rv):
+        """Return the log prior probability of val."""
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.log(self.prob(val, **rv))
+
+    def cdf(self, val, *, xp=np, **rv):
+        """Return the cumulative distribution function at val."""
+        chi_eff, q = self._get_conditions(rv)
+        return _cdf_chi2(val, chi_eff, q, self.a_max)
+
+    def _icdf(self, u, chi_eff, q):
+        """Inverse CDF at one point (Python floats u, chi_eff, q): table guess, Newton,
+        and Brent if needed."""
+        pre = _chi2_precompute(chi_eff, q, self.a_max)
+        lower, upper = pre[1], pre[2]
+        if pre[0] == "point":
+            return 0.5 * (lower + upper)
+        if u <= 0.0:
+            return lower
+        if u >= 1.0:
+            return upper
+
+        def cdf_pdf(x):
+            return _cdf_pdf_chi2_scalar(x, pre)
+
+        x0 = lower + (upper - lower) * self.table.guess(u, chi_eff, q)
+        xk, F, converged = _newton_update(x0, u, lower, upper, cdf_pdf, self.n_newton)
+        if not converged:
+            xk = _brent_update(xk, F, u, lower, upper, lambda x: cdf_pdf(x)[0])
+        return min(max(xk, lower), upper)
+
+    def rescale(self, val, *, xp=np, **rv):
+        """Map a sample from the unit interval to the prior (inverse CDF).
+        Scalars (as from dynesty) call _icdf directly; arrays go through np.vectorize."""
+        if (
+            isinstance(val, self.scalar_types)
+            and isinstance(rv.get("chi_eff"), self.scalar_types)
+            and isinstance(rv.get("mass_ratio"), self.scalar_types)
+        ):
+            u, ce, q = float(val), float(rv["chi_eff"]), float(rv["mass_ratio"])
+            self._current_chi_eff, self._current_mass_ratio = ce, q
+            return self._icdf(u, ce, q)
+        chi_eff, q = self._get_conditions(rv)
+        icdf = np.vectorize(
+            lambda uu, cc, qq: self._icdf(float(uu), float(cc), float(qq)),
+            otypes=[float],
+        )
+        return icdf(val, chi_eff, q)[()]
+
+    def chi1_from_chi2(self, chi2, **rv):
+        """Return chi_1z = (1 + q) chi_eff - q chi_2 for the given (or cached) conditions."""
+        chi_eff, q = self._get_conditions(rv)
+        return (1.0 + q) * chi_eff - q * chi2
+
+    def get_instantiation_dict(self):
+        instantiation_dict = Prior.get_instantiation_dict(self)
+        instantiation_dict.pop("table")
+        return instantiation_dict
+
+    def __repr__(self):
+        return Prior.__repr__(self)
 
 
 class EOSCheck(Constraint):

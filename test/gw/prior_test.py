@@ -4,10 +4,12 @@ import glob
 import os
 import sys
 import pickle
+import tempfile
 
 import array_api_compat as aac
 import numpy as np
 from astropy import cosmology
+from scipy.integrate import quad
 from scipy.stats import ks_2samp
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -679,6 +681,266 @@ class TestConditionalChiInPlane(unittest.TestCase):
         samples = self.derived.rescale(self.unit, **self.derived_kwargs)
         np.testing.assert_allclose(
             self.derived.cdf(samples, **self.derived_kwargs), self.unit, atol=1e-14
+        )
+
+
+class TestConditionalIsotropicChieffPrior(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.a_max = 0.8
+        cls.directory = tempfile.TemporaryDirectory()
+        cls.table = bilby.gw.prior.ChieffTable(0.1, 1.0, cls.a_max, n_q=50, n_u=257)
+        cls.table.save(os.path.join(cls.directory.name, "chi_eff_table.npz"))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.directory.cleanup()
+
+    def setUp(self):
+        self.prior = bilby.gw.prior.ConditionalIsotropicChieffPrior(table=self.table)
+        rng = np.random.default_rng(1)
+        self.mass_ratio = rng.uniform(0.1, 1, 1000)
+        self.unit = rng.uniform(0, 1, 1000)
+
+    def test_required_variables(self):
+        self.assertEqual(self.prior.required_variables, ["mass_ratio"])
+
+    def test_rescale_inverts_cdf(self):
+        samples = self.prior.rescale(self.unit, mass_ratio=self.mass_ratio)
+        np.testing.assert_allclose(
+            self.prior.cdf(samples, mass_ratio=self.mass_ratio),
+            self.unit,
+            rtol=0,
+            atol=1e-9,
+        )
+
+    def test_scalar_rescale_matches_array_rescale(self):
+        samples = self.prior.rescale(self.unit[:10], mass_ratio=self.mass_ratio[:10])
+        for unit, mass_ratio, sample in zip(
+            self.unit[:10], self.mass_ratio[:10], samples
+        ):
+            self.assertEqual(
+                self.prior.rescale(float(unit), mass_ratio=float(mass_ratio)), sample
+            )
+
+    def test_prob_is_normalized(self):
+        for mass_ratio in [0.2, 0.5, 0.8, 1.0]:
+            # Break the integral at the boundaries of the piecewise expressions.
+            points = [
+                sign * u * self.a_max / (1 + mass_ratio)
+                for u in [mass_ratio, 1 - mass_ratio, 1]
+                for sign in [-1, 1]
+            ]
+            norm, _ = quad(
+                lambda x: self.prior.prob(x, mass_ratio=mass_ratio),
+                -self.a_max,
+                self.a_max,
+                points=points,
+                limit=200,
+            )
+            self.assertAlmostEqual(norm, 1, places=8)
+
+    def test_prob_is_derivative_of_cdf(self):
+        # Even number of points to avoid chi_eff = 0, where the PDF has a cusp.
+        chi_eff = np.linspace(-0.95, 0.95, 40) * self.a_max
+        step = 1e-5
+        for mass_ratio in [0.2, 0.5, 0.8, 1.0]:
+            numerical = (
+                self.prior.cdf(chi_eff + step, mass_ratio=mass_ratio)
+                - self.prior.cdf(chi_eff - step, mass_ratio=mass_ratio)
+            ) / (2 * step)
+            np.testing.assert_allclose(
+                self.prior.prob(chi_eff, mass_ratio=mass_ratio), numerical, rtol=1e-6
+            )
+
+    def test_cdf_is_symmetric(self):
+        chi_eff = np.linspace(0, 1, 21) * self.a_max
+        for mass_ratio in [0.2, 0.5, 0.8, 1.0]:
+            np.testing.assert_allclose(
+                self.prior.cdf(-chi_eff, mass_ratio=mass_ratio),
+                1 - self.prior.cdf(chi_eff, mass_ratio=mass_ratio),
+                rtol=0,
+                atol=1e-14,
+            )
+            self.assertEqual(self.prior.cdf(-self.a_max, mass_ratio=mass_ratio), 0)
+            self.assertEqual(self.prior.cdf(self.a_max, mass_ratio=mass_ratio), 1)
+
+    def test_prob_is_finite_at_case_boundaries(self):
+        for mass_ratio in [0.3, 0.5, 0.7, 1.0]:
+            chi_eff = (
+                np.array([0, mass_ratio, 1 - mass_ratio, 1])
+                * self.a_max
+                / (1 + mass_ratio)
+            )
+            prob = self.prior.prob(chi_eff, mass_ratio=mass_ratio)
+            self.assertTrue(np.all(np.isfinite(prob)))
+            self.assertTrue(np.all(prob > 0))
+
+    def test_matches_isotropic_spins(self):
+        rng = np.random.default_rng(2)
+        n_samples = 20000
+        mass_ratio = 0.6
+        chi_1, chi_2 = (
+            rng.uniform(0, self.a_max, n_samples) * rng.uniform(-1, 1, n_samples)
+            for _ in range(2)
+        )
+        expected = (chi_1 + mass_ratio * chi_2) / (1 + mass_ratio)
+        samples = self.prior.rescale(
+            rng.uniform(0, 1, n_samples), mass_ratio=mass_ratio
+        )
+        self.assertGreater(ks_2samp(samples, expected).pvalue, 0.001)
+
+    def test_table_round_trip(self):
+        table = bilby.gw.prior.ChieffTable.load(self.prior.table_file)
+        np.testing.assert_array_equal(table.inv_table, self.table.inv_table)
+        self.assertEqual(table.settings(), self.table.settings())
+
+    def test_repr_round_trip(self):
+        new = bilby.core.prior.PriorDict({"chi_eff": repr(self.prior)})["chi_eff"]
+        self.assertIsInstance(new, bilby.gw.prior.ConditionalIsotropicChieffPrior)
+        np.testing.assert_array_equal(new.table.inv_table, self.table.inv_table)
+        np.testing.assert_array_equal(
+            new.rescale(self.unit, mass_ratio=self.mass_ratio),
+            self.prior.rescale(self.unit, mass_ratio=self.mass_ratio),
+        )
+
+
+class TestConditionalIsotropicChi2zPrior(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.a_max = 0.8
+        cls.directory = tempfile.TemporaryDirectory()
+        cls.chi_eff_table = bilby.gw.prior.ChieffTable(
+            0.2, 1.0, cls.a_max, n_q=50, n_u=257
+        )
+        cls.chi_eff_table.save(os.path.join(cls.directory.name, "chi_eff_table.npz"))
+        cls.table = bilby.gw.prior.Chi2zTable(
+            0.2, 1.0, cls.a_max, n_q=20, n_chieff=41, n_u=129
+        )
+        cls.table.save(os.path.join(cls.directory.name, "chi_2_table.npz"))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.directory.cleanup()
+
+    def setUp(self):
+        self.chi_eff_prior = bilby.gw.prior.ConditionalIsotropicChieffPrior(
+            table=self.chi_eff_table
+        )
+        self.prior = bilby.gw.prior.ConditionalIsotropicChi2zPrior(table=self.table)
+        rng = np.random.default_rng(3)
+        self.mass_ratio = rng.uniform(0.2, 1, 1000)
+        self.chi_eff = self.chi_eff_prior.rescale(
+            rng.uniform(0, 1, 1000), mass_ratio=self.mass_ratio
+        )
+        self.unit = rng.uniform(0, 1, 1000)
+        self.kwargs = dict(chi_eff=self.chi_eff, mass_ratio=self.mass_ratio)
+
+    def _integrand(self, chi_2, chi_eff, mass_ratio):
+        """Unnormalized density, log(a_max / |chi_1|) log(a_max / |chi_2|)."""
+        chi_1 = (1 + mass_ratio) * chi_eff - mass_ratio * chi_2
+        return np.log(self.a_max / abs(chi_1)) * np.log(self.a_max / abs(chi_2))
+
+    def _support(self, chi_eff, mass_ratio):
+        lower = max(-self.a_max, ((1 + mass_ratio) * chi_eff - self.a_max) / mass_ratio)
+        upper = min(self.a_max, ((1 + mass_ratio) * chi_eff + self.a_max) / mass_ratio)
+        return lower, upper
+
+    def test_required_variables(self):
+        self.assertEqual(self.prior.required_variables, ["chi_eff", "mass_ratio"])
+
+    def test_rescale_inverts_cdf(self):
+        samples = self.prior.rescale(self.unit, **self.kwargs)
+        np.testing.assert_allclose(
+            self.prior.cdf(samples, **self.kwargs), self.unit, rtol=0, atol=1e-9
+        )
+
+    def test_scalar_rescale_matches_array_rescale(self):
+        samples = self.prior.rescale(
+            self.unit[:10], chi_eff=self.chi_eff[:10], mass_ratio=self.mass_ratio[:10]
+        )
+        for unit, chi_eff, mass_ratio, sample in zip(
+            self.unit[:10], self.chi_eff[:10], self.mass_ratio[:10], samples
+        ):
+            self.assertEqual(
+                self.prior.rescale(
+                    float(unit), chi_eff=float(chi_eff), mass_ratio=float(mass_ratio)
+                ),
+                sample,
+            )
+
+    def test_cdf_matches_numerical_integral(self):
+        # The last two cases have narrow supports, where the Beta series is used.
+        for chi_eff, mass_ratio in [
+            (0.1, 0.5),
+            (-0.3, 0.8),
+            (0.0, 1.0),
+            (0.75, 0.6),
+            (-0.79, 0.9),
+        ]:
+            lower, upper = self._support(chi_eff, mass_ratio)
+            singular = [
+                x
+                for x in [0, (1 + mass_ratio) * chi_eff / mass_ratio]
+                if lower < x < upper
+            ]
+            norm, _ = quad(
+                self._integrand,
+                lower,
+                upper,
+                args=(chi_eff, mass_ratio),
+                points=singular,
+            )
+            for fraction in [0.1, 0.37, 0.5, 0.9]:
+                chi_2 = lower + fraction * (upper - lower)
+                integral, _ = quad(
+                    self._integrand,
+                    lower,
+                    chi_2,
+                    args=(chi_eff, mass_ratio),
+                    points=[x for x in singular if x < chi_2] or None,
+                )
+                self.assertAlmostEqual(
+                    float(
+                        self.prior.cdf(chi_2, chi_eff=chi_eff, mass_ratio=mass_ratio)
+                    ),
+                    integral / norm,
+                    places=9,
+                )
+
+    def test_point_support(self):
+        sample = self.prior.rescale(0.3, chi_eff=self.a_max, mass_ratio=0.5)
+        self.assertAlmostEqual(sample, self.a_max)
+
+    def test_joint_samples_match_isotropic_spins(self):
+        rng = np.random.default_rng(4)
+        n_samples = 20000
+        mass_ratio = 0.6
+        chi_eff = self.chi_eff_prior.rescale(
+            rng.uniform(0, 1, n_samples), mass_ratio=mass_ratio
+        )
+        chi_2 = self.prior.rescale(
+            rng.uniform(0, 1, n_samples), chi_eff=chi_eff, mass_ratio=mass_ratio
+        )
+        chi_1 = (1 + mass_ratio) * chi_eff - mass_ratio * chi_2
+        for samples in [chi_1, chi_2]:
+            expected = rng.uniform(0, self.a_max, n_samples) * rng.uniform(
+                -1, 1, n_samples
+            )
+            self.assertGreater(ks_2samp(samples, expected).pvalue, 0.001)
+
+    def test_table_round_trip(self):
+        table = bilby.gw.prior.Chi2zTable.load(self.prior.table_file)
+        np.testing.assert_array_equal(table.inv_table, self.table.inv_table)
+        self.assertEqual(table.settings(), self.table.settings())
+
+    def test_repr_round_trip(self):
+        new = bilby.core.prior.PriorDict({"chi_2": repr(self.prior)})["chi_2"]
+        self.assertIsInstance(new, bilby.gw.prior.ConditionalIsotropicChi2zPrior)
+        np.testing.assert_array_equal(new.table.inv_table, self.table.inv_table)
+        np.testing.assert_array_equal(
+            new.rescale(self.unit, **self.kwargs),
+            self.prior.rescale(self.unit, **self.kwargs),
         )
 
 
