@@ -1892,7 +1892,19 @@ class Chi2zTable:
         """For each (q, chi_eff), tabulate the CDF on the uniform s grid (monotonic,
         from 0 to 1) and invert it onto the uniform u grid.  At |chi_eff| = a_max
         the support degenerates; its rows use the limiting shape 3 s^2 - 2 s^3 of
-        the Beta series."""
+        the Beta series.
+
+        On the table rows s is always the u grid, so the regularised incomplete
+        Beta functions of the narrow-support series depend only on the sign of
+        chi_eff (which fixes (ps, p1)); they are computed once here and each
+        narrow row is a matrix-vector product."""
+        betainc_s = {
+            sign: betainc(ps[:, None] + 1.0, p1[:, None] + 1.0, self.u_grid[None, :])
+            for sign, (ps, p1) in (
+                (1, (_SERIES_N, _SERIES_M)),  # chi_eff >= 0
+                (-1, (_SERIES_M, _SERIES_N)),  # chi_eff < 0
+            )
+        }
         for i, q in enumerate(self.q_grid):
             if i % max(1, len(self.q_grid) // 10) == 0:
                 logger.info(f"Building chi_2 table: q row {i + 1}/{len(self.q_grid)}")
@@ -1902,6 +1914,10 @@ class Chi2zTable:
                     # Degenerate support (|chi_eff| = a_max): use the limiting shape of the
                     # Beta series in s, 3 s^2 - 2 s^3, so that the table is continuous in chi_eff.
                     F_row = 3.0 * self.u_grid**2 - 2.0 * self.u_grid**3
+                elif pre[0] == "narrow":
+                    coef_beta = pre[5]
+                    F_row = coef_beta @ betainc_s[1 if chi_eff >= 0.0 else -1]
+                    F_row = np.maximum.accumulate(np.clip(F_row, 0.0, 1.0))
                 else:
                     lower, upper = pre[1], pre[2]
                     chi2_grid = lower + (upper - lower) * self.u_grid
