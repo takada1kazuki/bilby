@@ -1,4 +1,5 @@
 import unittest
+from functools import partial
 
 import array_api_compat as aac
 import numpy as np
@@ -626,6 +627,131 @@ class TestGenerateAllParameters(unittest.TestCase):
             self.assertIn(key, output_sample)
         for key, val in self.parameters.items():
             self.assertTrue(output_sample[key] == val)
+
+
+class TestMu1Conversion(unittest.TestCase):
+    def setUp(self):
+        self.chirp_mass = 1.2
+        self.Mcref = 1.19
+        self.fref = 200.0
+        self.spins = dict(mass_ratio=0.8, chi_1=0.02, chi_2=-0.01)
+        self.mu1 = conversion.mu1_approx(
+            self.chirp_mass,
+            **self.spins,
+            Mcref=self.Mcref,
+            fref=self.fref,
+        )
+        self.parameters = dict(
+            mu1=self.mu1,
+            luminosity_distance=100.0,
+            theta_jn=0.4,
+            psi=0.1,
+            phase=0.2,
+            geocent_time=0.0,
+            ra=1.0,
+            dec=0.5,
+            lambda_1=300.0,
+            lambda_2=300.0,
+            **self.spins,
+        )
+
+    def _convert(self, parameters, **kwargs):
+        return conversion.convert_to_lal_binary_neutron_star_parameters(
+            parameters, **kwargs
+        )
+
+    def test_bns_conversion_adds_chirp_mass(self):
+        original = self.parameters.copy()
+        converted, added_keys = self._convert(
+            self.parameters,
+            Mcref=self.Mcref,
+            fref=self.fref,
+        )
+        self.assertAlmostEqual(converted["chirp_mass"], self.chirp_mass, places=12)
+        self.assertIn("chirp_mass", added_keys)
+        for key in ["mass_1", "mass_2"]:
+            self.assertIn(key, converted)
+        self.assertAlmostEqual(
+            conversion.component_masses_to_chirp_mass(
+                converted["mass_1"], converted["mass_2"]
+            ),
+            self.chirp_mass,
+            places=12,
+        )
+        self.assertEqual(self.parameters, original)
+
+    def test_existing_chirp_mass_is_kept(self):
+        self.parameters["chirp_mass"] = 1.3
+        converted, added_keys = self._convert(self.parameters)
+        self.assertEqual(converted["chirp_mass"], 1.3)
+        self.assertNotIn("chirp_mass", added_keys)
+
+    def test_missing_mcref_raises(self):
+        with self.assertRaises(ValueError):
+            self._convert(self.parameters)
+
+    def test_waveform_generator_with_partial(self):
+        waveform_generator = bilby.gw.WaveformGenerator(
+            duration=4,
+            sampling_frequency=2048,
+            frequency_domain_source_model=bilby.gw.source.lal_binary_neutron_star,
+            parameter_conversion=partial(
+                conversion.convert_to_lal_binary_neutron_star_parameters,
+                Mcref=self.Mcref,
+                fref=self.fref,
+            ),
+            waveform_arguments=dict(
+                waveform_approximant="TaylorF2", reference_frequency=20.0
+            ),
+        )
+        with_mu1 = waveform_generator.frequency_domain_strain(self.parameters)
+        parameters = self.parameters.copy()
+        del parameters["mu1"]
+        parameters["chirp_mass"] = self.chirp_mass
+        with_chirp_mass = waveform_generator.frequency_domain_strain(parameters)
+        np.testing.assert_allclose(
+            with_mu1["plus"], with_chirp_mass["plus"], rtol=1e-10, atol=0
+        )
+
+    def test_generate_all_bns_parameters_with_mu1(self):
+        data_frame = pd.DataFrame(
+            {key: [value] * 10 for key, value in self.parameters.items()}
+        )
+        # Mcref is taken from the mu1 prior, or given explicitly.
+        mu1_range = [
+            conversion.mu1_approx(
+                chirp_mass,
+                **self.spins,
+                Mcref=self.Mcref,
+                fref=self.fref,
+            )
+            for chirp_mass in [1.21, 1.17]
+        ]
+        priors = bilby.core.prior.PriorDict(
+            dict(
+                mu1=bilby.gw.prior.Mu1Prior(
+                    minimum=mu1_range[0],
+                    maximum=mu1_range[1],
+                    Mcref=self.Mcref,
+                    fref=self.fref,
+                    minimum_chirp_mass=1.17,
+                    maximum_chirp_mass=1.21,
+                )
+            )
+        )
+        for kwargs in [
+            dict(priors=priors),
+            dict(
+                Mcref=self.Mcref,
+                fref=self.fref,
+            ),
+        ]:
+            for sample in [self.parameters, data_frame]:
+                output = conversion.generate_all_bns_parameters(sample, **kwargs)
+                np.testing.assert_allclose(output["chirp_mass"], self.chirp_mass)
+                for key in ["mass_1", "mass_2", "total_mass", "lambda_tilde"]:
+                    self.assertIn(key, output)
+                self.assertNotIn("Mcref", output)
 
 
 class TestDistanceTransformations(unittest.TestCase):

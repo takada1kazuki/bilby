@@ -36,6 +36,8 @@ from .conversion import (
     generate_all_bbh_parameters,
     chirp_mass_and_mass_ratio_to_total_mass,
     total_mass_and_mass_ratio_to_component_masses,
+    U,
+    psi1_prime,
 )
 from .cosmology import get_cosmology, z_at_value
 from .source import PARAMETER_SETS
@@ -813,6 +815,119 @@ class ConditionalChiInPlane(ConditionalBasePrior):
             if key in instantiation_dict:
                 instantiation_dict[key] = value
         return instantiation_dict
+
+
+class Mu1Prior(Prior):
+    r"""
+    Prior for mu1:
+
+    .. math::
+
+        \pi(\mu_1) = s \mu_1 + c, \qquad \mu_{1,\min} \le \mu_1 \le \mu_{1,\max},
+
+        s = -\frac{2}{(M_{c,\max}^2 - M_{c,\min}^2)} \left(\frac{d\mu_1}{dM_c}\right)^{-2},
+        \qquad
+        c = \frac{1}{\mu_{1,\max} - \mu_{1,\min}} - \frac{s}{2} (\mu_{1,\max} + \mu_{1,\min}).
+
+    This prior is valid only for a narrow chirp-mass range, such as for BNS
+    because the slope uses d mu1 / d Mc at Mcref for simplicity.
+    """
+
+    def __init__(
+        self,
+        minimum,
+        maximum,
+        Mcref,
+        minimum_chirp_mass,
+        maximum_chirp_mass,
+        fref,
+        name="mu1",
+        latex_label=r"$\mu_1$",
+        unit=None,
+        boundary=None,
+    ):
+        """
+        Parameters
+        ==========
+        minimum, maximum: float
+            Support of mu1.
+        Mcref: float
+            Reference chirp mass [M_sun] at which d mu1 / d Mc is evaluated.
+        minimum_chirp_mass, maximum_chirp_mass: float
+            Range of the chirp-mass prior p(Mc) proportional to Mc [M_sun]
+            that fixes the slope.
+        fref: float
+            Frequency [Hz] at which the PN coefficients of the mu1 are evaluated.
+        name: str
+            See superclass
+        latex_label: str
+            See superclass
+        unit: str
+            See superclass
+        boundary: str
+            See superclass
+
+        Raises
+        ======
+        ValueError
+            If the density becomes negative inside the support (the density
+            decreases with mu1, so this is checked at the maximum of mu1).
+        """
+        super().__init__(
+            minimum=minimum,
+            maximum=maximum,
+            name=name,
+            latex_label=latex_label,
+            unit=unit,
+            boundary=boundary,
+        )
+        self.Mcref = float(Mcref)
+        self.minimum_chirp_mass = float(minimum_chirp_mass)
+        self.maximum_chirp_mass = float(maximum_chirp_mass)
+        self.fref = float(fref)
+
+        self.dmu1_dMc = U[0, 0] * psi1_prime(self.Mcref, self.fref)
+        chirp_mass_range = self.maximum_chirp_mass**2 - self.minimum_chirp_mass**2
+        self.slope = -2.0 / (chirp_mass_range * self.dmu1_dMc**2)
+        self.const = 1.0 / (self.maximum - self.minimum) + (
+            self.maximum + self.minimum
+        ) / (chirp_mass_range * self.dmu1_dMc**2)
+
+        pdf_at_max = self.slope * self.maximum + self.const
+        if pdf_at_max < 0.0:
+            raise ValueError("Mu1Prior becomes negative inside its support.")
+
+    def prob(self, val, *, xp=np):
+        """Return the prior probability of val."""
+        x = np.asarray(val, dtype=float)
+        pdf = self.slope * x + self.const
+        return np.where(self.is_in_prior_range(x), pdf, 0.0)[()]
+
+    def ln_prob(self, val, *, xp=np):
+        """Return the log prior probability of val."""
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.log(self.prob(val))[()]
+
+    def cdf(self, val, *, xp=np):
+        """Return the cumulative distribution function at val."""
+        x = np.asarray(val, dtype=float)
+        F = self.slope * (
+            (x - self.minimum) * (x + self.minimum)
+        ) / 2.0 + self.const * (x - self.minimum)
+        F = np.where(x <= self.minimum, 0.0, F)
+        F = np.where(x >= self.maximum, 1.0, F)
+        return np.clip(F, 0.0, 1.0)[()]
+
+    def rescale(self, val, *, xp=np):
+        """Analytic inverse CDF."""
+        u = np.asarray(val, dtype=float)
+        A = self.minimum + self.const / self.slope
+        root = np.sqrt(A**2 + 2 * u / self.slope)
+        mu1 = -self.const / self.slope - root
+        return np.clip(mu1, self.minimum, self.maximum)[()]
+
+    def __repr__(self):
+        return Prior.__repr__(self)
 
 
 class EOSCheck(Constraint):
