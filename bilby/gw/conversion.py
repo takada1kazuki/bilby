@@ -352,10 +352,16 @@ def convert_to_lal_binary_neutron_star_parameters(parameters, Mcref=None, fref=N
     For details on tidal parameters see https://arxiv.org/pdf/1402.5156.pdf.
 
     If mu1 is given instead of chirp_mass, chirp_mass is computed from mu1,
-    mass_ratio, chi_1 and chi_2 with ``mu1_to_chirp_mass``.  For a
-    WaveformGenerator, pass e.g.
-    ``functools.partial(convert_to_lal_binary_neutron_star_parameters,
-    Mcref=priors["mu1"].Mcref, fref=priors["mu1"].fref)``.
+    mass_ratio, chi_1 and chi_2 with ``mu1_to_chirp_mass``.  A
+    WaveformGenerator passes only the parameters, so pass it a module-level
+    function that sets Mcref and fref, e.g.
+
+    .. code-block:: python
+
+        def convert_to_lal_parameters(parameters):
+            return convert_to_lal_binary_neutron_star_parameters(
+                parameters, Mcref=priors["mu1"].Mcref, fref=priors["mu1"].fref
+            )
 
     Parameters
     ==========

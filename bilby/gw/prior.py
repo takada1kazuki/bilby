@@ -1402,7 +1402,13 @@ class BNSPriorDict(CBCPriorDict):
             Same as input
         """
         out_sample = fill_from_fixed_priors(sample, self)
-        out_sample, _ = convert_to_lal_binary_neutron_star_parameters(out_sample)
+        # Mcref and fref of the mu1 prior are needed to convert mu1 to chirp_mass.
+        mu1_prior = self.get("mu1", None)
+        out_sample, _ = convert_to_lal_binary_neutron_star_parameters(
+            out_sample,
+            Mcref=getattr(mu1_prior, "Mcref", None),
+            fref=getattr(mu1_prior, "fref", None),
+        )
         out_sample = generate_mass_parameters(out_sample)
         out_sample = generate_tidal_parameters(out_sample)
         return out_sample

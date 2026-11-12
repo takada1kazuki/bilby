@@ -707,6 +707,33 @@ class TestMu1Prior(unittest.TestCase):
             new.rescale(self.unit), self.prior.rescale(self.unit)
         )
 
+    def test_bns_prior_dict_with_mass_constraints(self):
+        # The default conversion takes Mcref and fref from the mu1 prior.
+        def to_mass_1(chirp_mass):
+            return conversion.chirp_mass_and_mass_ratio_to_component_masses(
+                chirp_mass, self.spins["mass_ratio"]
+            )[0]
+
+        mass_1_cut = to_mass_1(0.5 * (self.mc_min + self.mc_max))
+        priors = bilby.gw.prior.BNSPriorDict(
+            dictionary=dict(
+                mu1=self.prior,
+                mass_ratio=self.spins["mass_ratio"],
+                chi_1=self.spins["chi_1"],
+                chi_2=self.spins["chi_2"],
+                mass_1=bilby.core.prior.Constraint(0.0, mass_1_cut, name="mass_1"),
+            )
+        )
+        samples = priors.sample(1000)
+        mass_1 = to_mass_1(
+            bilby.gw.conversion.mu1_to_chirp_mass(
+                samples["mu1"], **self.spins, **self.reference
+            )
+        )
+        self.assertEqual(len(samples["mu1"]), 1000)
+        self.assertTrue(np.all(mass_1 <= mass_1_cut))
+        self.assertLess(np.min(mass_1), to_mass_1(self.mc_min) + 1e-3)
+
 
 if __name__ == "__main__":
     unittest.main()

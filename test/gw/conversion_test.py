@@ -1,5 +1,5 @@
+import json
 import unittest
-from functools import partial
 
 import array_api_compat as aac
 import numpy as np
@@ -629,11 +629,19 @@ class TestGenerateAllParameters(unittest.TestCase):
             self.assertTrue(output_sample[key] == val)
 
 
+def _convert_with_mu1(parameters):
+    # A module-level function, as passed to a WaveformGenerator in a PE script.
+    return conversion.convert_to_lal_binary_neutron_star_parameters(
+        parameters, Mcref=TestMu1Conversion.Mcref, fref=TestMu1Conversion.fref
+    )
+
+
 class TestMu1Conversion(unittest.TestCase):
+    Mcref = 1.19
+    fref = 200.0
+
     def setUp(self):
         self.chirp_mass = 1.2
-        self.Mcref = 1.19
-        self.fref = 200.0
         self.spins = dict(mass_ratio=0.8, chi_1=0.02, chi_2=-0.01)
         self.mu1 = conversion.mu1_approx(
             self.chirp_mass,
@@ -690,16 +698,12 @@ class TestMu1Conversion(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._convert(self.parameters)
 
-    def test_waveform_generator_with_partial(self):
+    def test_waveform_generator_with_conversion_function(self):
         waveform_generator = bilby.gw.WaveformGenerator(
             duration=4,
             sampling_frequency=2048,
             frequency_domain_source_model=bilby.gw.source.lal_binary_neutron_star,
-            parameter_conversion=partial(
-                conversion.convert_to_lal_binary_neutron_star_parameters,
-                Mcref=self.Mcref,
-                fref=self.fref,
-            ),
+            parameter_conversion=_convert_with_mu1,
             waveform_arguments=dict(
                 waveform_approximant="TaylorF2", reference_frequency=20.0
             ),
@@ -712,6 +716,13 @@ class TestMu1Conversion(unittest.TestCase):
         np.testing.assert_allclose(
             with_mu1["plus"], with_chirp_mass["plus"], rtol=1e-10, atol=0
         )
+        # The conversion function must be saved in the result JSON.
+        encoded = json.dumps(
+            waveform_generator.parameter_conversion,
+            cls=bilby.core.utils.BilbyJsonEncoder,
+        )
+        decoded = json.loads(encoded, object_hook=bilby.core.utils.decode_bilby_json)
+        self.assertIs(decoded, _convert_with_mu1)
 
     def test_generate_all_bns_parameters_with_mu1(self):
         data_frame = pd.DataFrame(
