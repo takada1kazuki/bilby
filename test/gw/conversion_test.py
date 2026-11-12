@@ -628,6 +628,67 @@ class TestGenerateAllParameters(unittest.TestCase):
             self.assertTrue(output_sample[key] == val)
 
 
+class TestChi1FromChiEffConversion(unittest.TestCase):
+    def setUp(self):
+        self.mass_ratio = 0.5
+        self.chi_1 = 0.3
+        self.chi_2 = -0.2
+        self.chi_eff = (self.chi_1 + self.mass_ratio * self.chi_2) / (
+            1 + self.mass_ratio
+        )
+        self.parameters = dict(
+            chirp_mass=10.0,
+            mass_ratio=self.mass_ratio,
+            chi_eff=self.chi_eff,
+            chi_2=self.chi_2,
+        )
+
+    def test_bbh_conversion_adds_chi_1(self):
+        converted, added_keys = conversion.convert_to_lal_binary_black_hole_parameters(
+            self.parameters
+        )
+        self.assertAlmostEqual(converted["chi_1"], self.chi_1, places=14)
+        self.assertIn("chi_1", added_keys)
+        self.assertNotIn("chi_1", self.parameters)
+        self.assertAlmostEqual(converted["a_1"], self.chi_1, places=14)
+        self.assertEqual(converted["tilt_1"], 0.0)
+        self.assertAlmostEqual(converted["a_2"], abs(self.chi_2), places=14)
+        self.assertEqual(converted["tilt_2"], np.pi)
+
+    def test_mass_ratio_from_component_masses(self):
+        parameters = self.parameters.copy()
+        del parameters["chirp_mass"], parameters["mass_ratio"]
+        parameters.update(mass_1=20.0, mass_2=20.0 * self.mass_ratio)
+        converted, _ = conversion.convert_to_lal_binary_black_hole_parameters(
+            parameters
+        )
+        self.assertAlmostEqual(converted["chi_1"], self.chi_1, places=14)
+
+    def test_in_plane_spin(self):
+        self.parameters.update(chi_1_in_plane=0.4, chi_2_in_plane=0.1)
+        converted, _ = conversion.convert_to_lal_binary_black_hole_parameters(
+            self.parameters
+        )
+        self.assertAlmostEqual(converted["a_1"], 0.5, places=14)
+        self.assertAlmostEqual(np.cos(converted["tilt_1"]), 0.6, places=14)
+
+    def test_existing_chi_1_is_kept(self):
+        self.parameters["chi_1"] = 0.1
+        converted, added_keys = conversion.convert_to_lal_binary_black_hole_parameters(
+            self.parameters
+        )
+        self.assertEqual(converted["chi_1"], 0.1)
+        self.assertNotIn("chi_1", added_keys)
+
+    def test_array_input(self):
+        parameters = {key: np.full(5, value) for key, value in self.parameters.items()}
+        converted, _ = conversion.convert_to_lal_binary_black_hole_parameters(
+            parameters
+        )
+        np.testing.assert_allclose(converted["chi_1"], self.chi_1, atol=1e-14)
+        np.testing.assert_allclose(converted["a_1"], self.chi_1, atol=1e-14)
+
+
 class TestDistanceTransformations(unittest.TestCase):
     def setUp(self):
         self.distances = np.linspace(1, 1000, 100)

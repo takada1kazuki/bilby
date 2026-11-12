@@ -276,10 +276,11 @@ def convert_to_lal_binary_black_hole_parameters(parameters):
         converted_parameters, require_add=False
     )
 
+    spin_keys = original_keys + _generate_chi_1_from_chi_eff(converted_parameters)
     for idx in ["1", "2"]:
         key = "chi_{}".format(idx)
-        if key in original_keys:
-            if "chi_{}_in_plane".format(idx) in original_keys:
+        if key in spin_keys:
+            if "chi_{}_in_plane".format(idx) in spin_keys:
                 converted_parameters["a_{}".format(idx)] = (
                     converted_parameters[f"chi_{idx}"] ** 2
                     + converted_parameters[f"chi_{idx}_in_plane"] ** 2
@@ -288,7 +289,7 @@ def convert_to_lal_binary_black_hole_parameters(parameters):
                     converted_parameters[f"chi_{idx}"]
                     / converted_parameters[f"a_{idx}"]
                 )
-            elif "a_{}".format(idx) not in original_keys:
+            elif "a_{}".format(idx) not in spin_keys:
                 converted_parameters["a_{}".format(idx)] = abs(
                     converted_parameters[key]
                 )
@@ -1338,6 +1339,94 @@ def mass_2_and_chirp_mass_to_mass_ratio(mass_2, chirp_mass):
     # returns 1/q (because chirp mass is invariant under
     # mass_1 <-> mass_2)
     return 1 / mass_1_and_chirp_mass_to_mass_ratio(mass_2, chirp_mass)
+
+
+def chi_1_from_chi_eff_and_chi_2(mass_ratio, chi_eff, chi_2):
+    """
+    Convert the effective spin and the aligned spin of the secondary to the
+    aligned spin of the primary.
+
+    .. math::
+
+        \\chi_1 = (1 + q) \\chi_{\\rm eff} - q \\chi_2
+
+    Parameters
+    ==========
+    mass_ratio: float
+        Mass ratio of the binary, q = m_2 / m_1 <= 1
+    chi_eff: float
+        Effective aligned spin
+    chi_2: float
+        Aligned spin of the secondary
+
+    Returns
+    =======
+    chi_1: float
+        Aligned spin of the primary
+    """
+    return (1 + mass_ratio) * chi_eff - mass_ratio * chi_2
+
+
+def chi_2_from_chi_eff_and_chi_1(mass_ratio, chi_eff, chi_1):
+    """
+    Convert the effective spin and the aligned spin of the primary to the
+    aligned spin of the secondary.
+
+    .. math::
+
+        \\chi_2 = \\frac{(1 + q) \\chi_{\\rm eff} - \\chi_1}{q}
+
+    Parameters
+    ==========
+    mass_ratio: float
+        Mass ratio of the binary, q = m_2 / m_1 <= 1
+    chi_eff: float
+        Effective aligned spin
+    chi_1: float
+        Aligned spin of the primary
+
+    Returns
+    =======
+    chi_2: float
+        Aligned spin of the secondary
+    """
+    return ((1 + mass_ratio) * chi_eff - chi_1) / mass_ratio
+
+
+def _generate_chi_1_from_chi_eff(parameters):
+    """
+    Add chi_1 to parameters in place if chi_eff and chi_2 are given instead.
+
+    The mass ratio is taken from mass_ratio, or from mass_1 and mass_2.
+
+    Parameters
+    ==========
+    parameters: dict
+        Parameters to update in place
+
+    Returns
+    =======
+    added_keys: list
+        ["chi_1"] if chi_1 was added, otherwise []
+    """
+    if (
+        "chi_1" in parameters
+        or "chi_eff" not in parameters
+        or "chi_2" not in parameters
+    ):
+        return []
+    if "mass_ratio" in parameters:
+        mass_ratio = parameters["mass_ratio"]
+    elif "mass_1" in parameters and "mass_2" in parameters:
+        mass_ratio = component_masses_to_mass_ratio(
+            parameters["mass_1"], parameters["mass_2"]
+        )
+    else:
+        return []
+    parameters["chi_1"] = chi_1_from_chi_eff_and_chi_2(
+        mass_ratio, parameters["chi_eff"], parameters["chi_2"]
+    )
+    return ["chi_1"]
 
 
 def lambda_1_lambda_2_to_lambda_tilde(lambda_1, lambda_2, mass_1, mass_2):
