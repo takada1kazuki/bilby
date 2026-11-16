@@ -4,6 +4,7 @@ gravitational-wave sources.
 """
 
 import os
+from functools import partial
 import sys
 import multiprocessing
 import pickle
@@ -229,10 +230,11 @@ def convert_to_lal_binary_black_hole_parameters(parameters):
     # we do not require the component masses be added if no mass parameters are present
     converted_parameters = generate_component_masses(converted_parameters, require_add=False)
 
-    for idx in ['1', '2']:
-        key = 'chi_{}'.format(idx)
-        if key in original_keys:
-            if "chi_{}_in_plane".format(idx) in original_keys:
+    spin_keys = original_keys + _generate_chi_1_from_chi_eff(converted_parameters)
+    for idx in ["1", "2"]:
+        key = "chi_{}".format(idx)
+        if key in spin_keys:
+            if "chi_{}_in_plane".format(idx) in spin_keys:
                 converted_parameters["a_{}".format(idx)] = (
                     converted_parameters[f"chi_{idx}"] ** 2
                     + converted_parameters[f"chi_{idx}_in_plane"] ** 2
@@ -241,11 +243,13 @@ def convert_to_lal_binary_black_hole_parameters(parameters):
                     converted_parameters[f"chi_{idx}"]
                     / converted_parameters[f"a_{idx}"]
                 )
-            elif "a_{}".format(idx) not in original_keys:
-                converted_parameters['a_{}'.format(idx)] = abs(
-                    converted_parameters[key])
-                converted_parameters['cos_tilt_{}'.format(idx)] = \
-                    np.sign(converted_parameters[key])
+            elif "a_{}".format(idx) not in spin_keys:
+                converted_parameters["a_{}".format(idx)] = abs(
+                    converted_parameters[key]
+                )
+                converted_parameters["cos_tilt_{}".format(idx)] = np.sign(
+                    converted_parameters[key]
+                )
             else:
                 with np.errstate(invalid="raise"):
                     try:
@@ -283,7 +287,7 @@ def convert_to_lal_binary_black_hole_parameters(parameters):
     return converted_parameters, added_keys
 
 
-def convert_to_lal_binary_neutron_star_parameters(parameters):
+def convert_to_lal_binary_neutron_star_parameters(parameters, Mcref=None, fref=None):
     """
     Convert parameters we have into parameters we need.
 
@@ -299,10 +303,25 @@ def convert_to_lal_binary_neutron_star_parameters(parameters):
     The keys in added_keys should be popped after evaluating the waveform.
     For details on tidal parameters see https://arxiv.org/pdf/1402.5156.pdf.
 
+    If mu1 is given instead of chirp_mass, chirp_mass is computed from mu1,
+    mass_ratio, chi_1 and chi_2 with ``mu1_to_chirp_mass``.  A
+    WaveformGenerator passes only the parameters, so pass it a module-level
+    function that sets Mcref and fref, e.g.
+
+    .. code-block:: python
+
+        def convert_to_lal_parameters(parameters):
+            return convert_to_lal_binary_neutron_star_parameters(
+                parameters, Mcref=priors["mu1"].Mcref, fref=priors["mu1"].fref
+            )
+
     Parameters
     ==========
     parameters: dict
         dictionary of parameter values to convert into the required parameters
+    Mcref, fref: float, optional
+        Reference chirp mass [M_sun] and reference frequency [Hz] of the mu1
+        prior, required only if mu1 is given instead of chirp_mass.
 
     Returns
     =======
@@ -313,16 +332,32 @@ def convert_to_lal_binary_neutron_star_parameters(parameters):
     """
     converted_parameters = parameters.copy()
     original_keys = list(converted_parameters.keys())
-    converted_parameters, added_keys =\
-        convert_to_lal_binary_black_hole_parameters(converted_parameters)
+    # chi_1 is needed to convert mu1, so it is generated first.
+    mu1_added_keys = _generate_chi_1_from_chi_eff(converted_parameters)
+    mu1_added_keys += _generate_chirp_mass_from_mu1(converted_parameters, Mcref, fref)
+    converted_parameters, added_keys = convert_to_lal_binary_black_hole_parameters(
+        converted_parameters
+    )
+    added_keys = mu1_added_keys + added_keys
 
-    if not any([key in converted_parameters for key in
-                ['lambda_1', 'lambda_2',
-                 'lambda_tilde', 'delta_lambda_tilde', 'lambda_symmetric',
-                 'eos_polytrope_gamma_0', 'eos_spectral_pca_gamma_0', 'eos_v1']]):
-        converted_parameters['lambda_1'] = 0
-        converted_parameters['lambda_2'] = 0
-        added_keys = added_keys + ['lambda_1', 'lambda_2']
+    if not any(
+        [
+            key in converted_parameters
+            for key in [
+                "lambda_1",
+                "lambda_2",
+                "lambda_tilde",
+                "delta_lambda_tilde",
+                "lambda_symmetric",
+                "eos_polytrope_gamma_0",
+                "eos_spectral_pca_gamma_0",
+                "eos_v1",
+            ]
+        ]
+    ):
+        converted_parameters["lambda_1"] = 0
+        converted_parameters["lambda_2"] = 0
+        added_keys = added_keys + ["lambda_1", "lambda_2"]
         return converted_parameters, added_keys
 
     if 'delta_lambda_tilde' in converted_parameters.keys():
@@ -1068,6 +1103,145 @@ def component_masses_to_mass_ratio(mass_1, mass_2):
     return mass_2 / mass_1
 
 
+# ============================================================
+# Settings & functions for mu1
+# ============================================================
+# Rotation from the PN phase coefficients (psi_1, psi_2, psi_3) to (mu_1, mu_2, mu_3).
+# It was derived for the PN coefficients evaluated at fref = 200 Hz.
+
+U = np.array(
+    [
+        [0.97437198, 0.20868103, 0.08397302],
+        [-0.22132704, 0.82273827, 0.52356096],
+        [0.04016942, -0.52872863, 0.84783987],
+    ]
+)
+
+
+def beta(mass_ratio, chi_1, chi_2):
+    """1.5PN spin-orbit coefficient."""
+    eta1 = mass_ratio / (1 + mass_ratio) ** 2
+    b1 = (113 * (1 / (1 + mass_ratio)) ** 2 + 75 * eta1) * chi_1
+    b2 = (113 * (mass_ratio / (1 + mass_ratio)) ** 2 + 75 * eta1) * chi_2
+    return (b1 + b2) / 12
+
+
+def psi_1(chirp_mass, fref):
+    """0PN phase coefficient at fref [Hz]."""
+    # pi G f / c^3 [1 / kg]; multiplied by a mass [kg] it is dimensionless.
+    const = np.pi * gravitational_constant * fref / speed_of_light**3
+    chirp_mass = chirp_mass * solar_mass
+    return (3 / 128) * (const * chirp_mass) ** (-5 / 3)
+
+
+def psi1_prime(chirp_mass, fref):
+    """Derivative of ``psi_1`` with respect to the chirp mass [M_sun]."""
+    const = np.pi * gravitational_constant * fref / speed_of_light**3
+    return -(5 / 128) * (const * solar_mass) ** (-5 / 3) * chirp_mass ** (-8 / 3)
+
+
+def psi_2(chirp_mass, mass_ratio, fref):
+    """1PN phase coefficient at fref [Hz]."""
+    const = np.pi * gravitational_constant * fref / speed_of_light**3
+    eta1 = mass_ratio / (1 + mass_ratio) ** 2
+    return (
+        (55 / 384)
+        * (eta1 + 743 / 924)
+        * (eta1 ** (-2 / 5))
+        / (const * chirp_mass * solar_mass)
+    )
+
+
+def psi_3(chirp_mass, mass_ratio, chi_1, chi_2, fref):
+    """1.5PN phase coefficient (tail and spin-orbit) at fref [Hz]."""
+    const = np.pi * gravitational_constant * fref / speed_of_light**3
+    eta1 = mass_ratio / (1 + mass_ratio) ** 2
+    beta1 = beta(mass_ratio, chi_1, chi_2)
+    return (
+        (3 / 32)
+        * (beta1 - 4 * np.pi)
+        * (eta1 ** (-3 / 5))
+        * (const * chirp_mass * solar_mass) ** (-2 / 3)
+    )
+
+
+def _mu1_terms(mass_ratio, chi_1, chi_2, Mcref, fref):
+    """(psi_1, d psi_1 / d Mc, psi_2, psi_3) at the reference chirp mass."""
+    return (
+        psi_1(Mcref, fref),
+        psi1_prime(Mcref, fref),
+        psi_2(Mcref, mass_ratio, fref),
+        psi_3(Mcref, mass_ratio, chi_1, chi_2, fref),
+    )
+
+
+def mu1_approx(chirp_mass, mass_ratio, chi_1, chi_2, Mcref, fref):
+    """mu1 = U[00].psi_1 + U[01].psi_2 + U[02].psi_3, with psi_1 linearised in the chirp mass"""
+    psi1_ref, psi1prime, psi2, psi3 = _mu1_terms(mass_ratio, chi_1, chi_2, Mcref, fref)
+    return (
+        U[0, 0] * (psi1_ref + psi1prime * (chirp_mass - Mcref))
+        + U[0, 1] * psi2
+        + U[0, 2] * psi3
+    )
+
+
+def mu1_to_chirp_mass(mu1, mass_ratio, chi_1, chi_2, Mcref, fref):
+    """Inverse of ``mu1_approx``: Return the chirp mass [M_sun] for given
+    (mu1, mass_ratio, chi_1, chi_2)"""
+    psi1_ref, psi1prime, psi2, psi3 = _mu1_terms(mass_ratio, chi_1, chi_2, Mcref, fref)
+    return Mcref + (mu1 - U[0, 0] * psi1_ref - U[0, 1] * psi2 - U[0, 2] * psi3) / (
+        U[0, 0] * psi1prime
+    )
+
+
+def _generate_chirp_mass_from_mu1(parameters, Mcref=None, fref=None):
+    """
+    Add chirp_mass to ``parameters`` (in place) if mu1 is given instead.
+
+    The conversion uses ``mu1_to_chirp_mass`` and requires mass_ratio, chi_1 and
+    chi_2 in ``parameters``.
+
+    Parameters
+    ==========
+    parameters: dict or pandas.DataFrame
+        Parameters to convert, modified in place.
+    Mcref, fref: float, optional
+        Reference chirp mass [M_sun] and reference frequency [Hz] of the mu1
+        prior.  Required if mu1 is given without chirp_mass.
+
+    Returns
+    =======
+    added_keys: list
+        ["chirp_mass"] if it was added, otherwise [].
+
+    Raises
+    ======
+    ValueError
+        If mu1 is given without chirp_mass and Mcref or fref is None.
+    KeyError
+        If mu1 is given but mass_ratio, chi_1 or chi_2 is missing.
+    """
+    if "mu1" not in parameters or "chirp_mass" in parameters:
+        return []
+    if Mcref is None or fref is None:
+        raise ValueError(
+            "Converting mu1 to chirp_mass requires Mcref and fref; pass those "
+            "of the mu1 prior to the conversion function."
+        )
+    missing = [key for key in ["mass_ratio", "chi_1", "chi_2"] if key not in parameters]
+    if missing:
+        raise KeyError(f"Converting mu1 to chirp_mass requires {missing}.")
+    parameters["chirp_mass"] = mu1_to_chirp_mass(
+        parameters["mu1"],
+        parameters["mass_ratio"],
+        parameters["chi_1"],
+        parameters["chi_2"],
+        Mcref,
+        fref,
+    )
+    return ["chirp_mass"]
+
+
 def mass_1_and_chirp_mass_to_mass_ratio(mass_1, chirp_mass):
     """
     Calculate mass ratio from mass_1 and chirp_mass.
@@ -1116,6 +1290,94 @@ def mass_2_and_chirp_mass_to_mass_ratio(mass_2, chirp_mass):
     # returns 1/q (because chirp mass is invariant under
     # mass_1 <-> mass_2)
     return 1 / mass_1_and_chirp_mass_to_mass_ratio(mass_2, chirp_mass)
+
+
+def chi_1_from_chi_eff_and_chi_2(mass_ratio, chi_eff, chi_2):
+    """
+    Convert the effective spin and the aligned spin of the secondary to the
+    aligned spin of the primary.
+
+    .. math::
+
+        \\chi_1 = (1 + q) \\chi_{\\rm eff} - q \\chi_2
+
+    Parameters
+    ==========
+    mass_ratio: float
+        Mass ratio of the binary, q = m_2 / m_1 <= 1
+    chi_eff: float
+        Effective aligned spin
+    chi_2: float
+        Aligned spin of the secondary
+
+    Returns
+    =======
+    chi_1: float
+        Aligned spin of the primary
+    """
+    return (1 + mass_ratio) * chi_eff - mass_ratio * chi_2
+
+
+def chi_2_from_chi_eff_and_chi_1(mass_ratio, chi_eff, chi_1):
+    """
+    Convert the effective spin and the aligned spin of the primary to the
+    aligned spin of the secondary.
+
+    .. math::
+
+        \\chi_2 = \\frac{(1 + q) \\chi_{\\rm eff} - \\chi_1}{q}
+
+    Parameters
+    ==========
+    mass_ratio: float
+        Mass ratio of the binary, q = m_2 / m_1 <= 1
+    chi_eff: float
+        Effective aligned spin
+    chi_1: float
+        Aligned spin of the primary
+
+    Returns
+    =======
+    chi_2: float
+        Aligned spin of the secondary
+    """
+    return ((1 + mass_ratio) * chi_eff - chi_1) / mass_ratio
+
+
+def _generate_chi_1_from_chi_eff(parameters):
+    """
+    Add chi_1 to parameters in place if chi_eff and chi_2 are given instead.
+
+    The mass ratio is taken from mass_ratio, or from mass_1 and mass_2.
+
+    Parameters
+    ==========
+    parameters: dict
+        Parameters to update in place
+
+    Returns
+    =======
+    added_keys: list
+        ["chi_1"] if chi_1 was added, otherwise []
+    """
+    if (
+        "chi_1" in parameters
+        or "chi_eff" not in parameters
+        or "chi_2" not in parameters
+    ):
+        return []
+    if "mass_ratio" in parameters:
+        mass_ratio = parameters["mass_ratio"]
+    elif "mass_1" in parameters and "mass_2" in parameters:
+        mass_ratio = component_masses_to_mass_ratio(
+            parameters["mass_1"], parameters["mass_2"]
+        )
+    else:
+        return []
+    parameters["chi_1"] = chi_1_from_chi_eff_and_chi_2(
+        mass_ratio, parameters["chi_eff"], parameters["chi_2"]
+    )
+    return ["chi_1"]
 
 
 def lambda_1_lambda_2_to_lambda_tilde(lambda_1, lambda_2, mass_1, mass_2):
@@ -1743,7 +2005,9 @@ def generate_all_bbh_parameters(sample, likelihood=None, priors=None, npool=1):
     return output_sample
 
 
-def generate_all_bns_parameters(sample, likelihood=None, priors=None, npool=1):
+def generate_all_bns_parameters(
+    sample, likelihood=None, priors=None, npool=1, Mcref=None, fref=None
+):
     """
     From either a single sample or a set of samples fill in all missing
     BNS parameters, in place.
@@ -1763,19 +2027,32 @@ def generate_all_bns_parameters(sample, likelihood=None, priors=None, npool=1):
         Dictionary of prior objects, used to fill in non-sampled parameters.
     npool: int, (default=1)
         If given, perform generation (where possible) using a multiprocessing pool
-
-    .. versionchanged:: 2.5.1
-       To ensure that internal state of :code:`likelihood` is not changed by
-       this function, the initial value of :code:`likelihood.parameters` are
-       saved and reset at the end of the function.
+    Mcref, fref: float, optional
+        Reference chirp mass [M_sun] and reference frequency [Hz] of the mu1
+        prior, used if mu1 is given instead of chirp_mass.  If None, they are taken
+        from ``priors["mu1"]`` when available.  fref is not the
+        waveform reference_frequency in the waveform arguments.
     """
+    if priors is not None and "mu1" in priors:
+        if Mcref is None:
+            Mcref = getattr(priors["mu1"], "Mcref", None)
+        if fref is None:
+            fref = getattr(priors["mu1"], "fref", None)
     waveform_defaults = {
         'reference_frequency': 50.0, 'waveform_approximant': 'TaylorF2',
         'minimum_frequency': 20.0}
     output_sample = _generate_all_cbc_parameters(
-        sample, defaults=waveform_defaults,
-        base_conversion=convert_to_lal_binary_neutron_star_parameters,
-        likelihood=likelihood, priors=priors, npool=npool)
+        sample,
+        defaults=waveform_defaults,
+        base_conversion=partial(
+            convert_to_lal_binary_neutron_star_parameters,
+            Mcref=Mcref,
+            fref=fref,
+        ),
+        likelihood=likelihood,
+        priors=priors,
+        npool=npool,
+    )
     try:
         output_sample = generate_tidal_parameters(output_sample)
     except KeyError as e:
